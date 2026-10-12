@@ -1,0 +1,135 @@
+--- a/C:\Users\User\Desktop\Mutagen\examples\ruyam.py+++ b/C:\Users\User\Desktop\Mutagen\examples\ruyam.py@@ -5,13 +5,16 @@ import re
+ import statistics
+ import time
++import heapq
+ from collections import Counter, defaultdict, deque
+ from concurrent.futures import ThreadPoolExecutor
+-
+ from dataclasses import dataclass, field
+ from typing import Any, Callable, Optional
+-
+ from datetime import datetime, timezone
++from functools import lru_cache
++
++# Pre‑compiled regular expression used throughout the module
++_WORD_RE = re.compile(r"\w+")
+ 
+ 
+ @dataclass
+@@ -29,28 +32,42 @@ 
+     def remember(self, key, value):
+         self.facts[str(key)] = value
++        # Store the vectorized form for fast later similarity checks
+         self.embeddings[str(key)] = self.vectorize(str(value))
+ 
++    @staticmethod
++    @lru_cache(maxsize=1024)
++    def _tokenize(text: str):
++        """Return a tuple of lower‑cased word tokens.
++        Cached to avoid repeated regex work on identical strings.
++        """
++        return tuple(token.lower() for token in _WORD_RE.findall(text))
++
+     def vectorize(self, text):
+-        return Counter(
+-            token.lower()
+-            for token in re.findall(r"\w+", text)
+-        )
++        """Convert text to a Counter of token frequencies.
++        Utilises the cached token list for speed.
++        """
++        return Counter(self._tokenize(text))
+ 
+     def similarity(self, left, right):
+-        a = self.vectorize(left)
+-        b = self.vectorize(right)
++        # Try to reuse previously computed vectors when possible
++        a = self.embeddings.get(str(left)) or self.vectorize(str(left))
++        b = self.embeddings.get(str(right)) or self.vectorize(str(right))
+         intersection = set(a) & set(b)
+         numerator = sum(a[k] * b[k] for k in intersection)
+         denominator = math.sqrt(sum(v * v for v in a.values())) * math.sqrt(sum(v * v for v in b.values()))
+         return numerator / denominator if denominator else 0.0
+ 
+-    def retrieve(self, query, limit=5):
+-        return sorted(
+-            self.facts.items(),
+-            key=lambda item: self.similarity(query, str(item[1])),
+-            reverse=True
+-        )[:limit]
++    def retrieve(self, query, limit: int = 5):
++        """Return the *limit* most similar facts without sorting the whole list.
++        Uses ``heapq.nlargest`` for O(n log k) performance.
++        """
++        scored = (
++            (key, value, self.similarity(query, str(value)))
++            for key, value in self.facts.items()
++        )
++        top = heapq.nlargest(limit, scored, key=lambda item: item[2])
++        return [(k, v) for k, v, _ in top]
+ 
+ 
+ @dataclass
+@@ -86,10 +103,7 @@             name: self.executor.submit(self.execute, name, *args, **kwargs)
+             for name, args, kwargs in requests
+         }
+-        return {
+-            name: future.result(timeout=10)
+-            for name, future in futures.items()
+-        }
++        return {name: future.result(timeout=10) for name, future in futures.items()}
+ 
+     def describe(self):
+         return [
+@@ -118,7 +132,7 @@         }
+ 
+     def classify(self, query):
+-        tokens = re.findall(r"\w+", query.lower())
++        tokens = _WORD_RE.findall(query.lower())
+         if any(word in tokens for word in ("calculate", "sum", "multiply", "divide")):
+             return "calculation"
+         if any(word in tokens for word in ("remember", "recall", "previously")):
+@@ -195,27 +209,25 @@         self.register_tools()
+ 
+     def register_tools(self):
++        self.registry.register(Tool("echo", "Return the input text unchanged", lambda text: text))
++        self.registry.register(Tool("word_count", "Count words in a string", lambda text: len(text.split())))
++        self.registry.register(Tool("reverse", "Reverse a string", lambda text: text[::-1]))
+         self.registry.register(
+-            Tool("echo", "Return the input text unchanged", lambda text: text)
++            Tool(
++                "statistics",
++                "Calculate basic numeric statistics",
++                lambda values: {
++                    "mean": statistics.mean(values),
++                    "median": statistics.median(values),
++                    "stdev": statistics.pstdev(values),
++                    "minimum": min(values),
++                    "maximum": max(values),
++                }
++                if values
++                else {},
++            )
+         )
+-        self.registry.register(
+-            Tool("word_count", "Count words in a string", lambda text: len(text.split()))
+-        )
+-        self.registry.register(
+-            Tool("reverse", "Reverse a string", lambda text: text[::-1])
+-        )
+-        self.registry.register(
+-            Tool("statistics", "Calculate basic numeric statistics", lambda values: {
+-                "mean": statistics.mean(values),
+-                "median": statistics.median(values),
+-                "stdev": statistics.pstdev(values),
+-                "minimum": min(values),
+-                "maximum": max(values),
+-            } if values else {})
+-        )
+-        self.registry.register(
+-            Tool("json_encode", "Serialize data to JSON", lambda data: json.dumps(data, default=str))
+-        )
++        self.registry.register(Tool("json_encode", "Serialize data to JSON", lambda data: json.dumps(data, default=str)))
+ 
+     async def process(self, query):
+         started = time.perf_counter()

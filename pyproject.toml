@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mutagen-engine"
+version = "0.1.0"
+description = "The Experimental Evolution Engine for Code"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "MUTAGEN Team"}
+]
+keywords = ["ai", "code-optimization", "evolution", "mutation", "benchmarking"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Testing",
+]
+
+dependencies = [
+    "typer>=0.9.0,<1.0",
+    "rich>=13.0,<14.0",
+    "pydantic>=2.0,<3.0",
+    "pydantic-settings>=2.0,<3.0",
+    "sqlalchemy>=2.0,<3.0",
+    "alembic>=1.12,<2.0",
+    "psycopg[binary]>=3.1,<4.0",
+    "docker>=7.0,<8.0",
+    "celery[redis]>=5.3,<6.0",
+    "redis>=5.0,<6.0",
+    "google-generativeai>=0.8.0",
+    "python-dotenv>=1.0,<2.0",
+    "click>=8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.21",
+    "pytest-cov>=4.1",
+    "pytest-mock>=3.11",
+    "ruff>=0.1.0",
+    "mypy>=1.5",
+]
+
+[project.scripts]
+mutagen = "mutagen.cli.main:app_entry"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "unit: Unit tests (no external services)",
+    "cli: CLI interface tests",
+    "integration: Integration tests (require database)",
+    "sandbox: Sandbox tests (require Docker)",
+    "security: Security tests",
+    "slow: Slow tests",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
