@@ -144,6 +144,12 @@ class MutationCandidate(BaseModel):
     potential_risks: str = ""
     assumptions: str = ""
     content_hash: str = ""
+    target_symbol: Optional[str] = None
+    description: Optional[str] = None
+    expected_benefit: Optional[str] = None
+    complexity_analysis: Optional[dict[str, Any]] = None
+    risks: list[str] = Field(default_factory=list)
+    required_tests: list[str] = Field(default_factory=list)
 
     @field_validator("source_code")
     @classmethod
@@ -263,6 +269,7 @@ class ExperimentConfig(BaseModel):
         "speed": 0.50, "memory": 0.25, "complexity": 0.15, "maintainability": 0.10
     })
     dry_run: bool = False
+    stop_on_stagnation: bool = False
 
 
 class ExperimentSummary(BaseModel):

@@ -36,25 +36,58 @@ from mutagen.schemas import (
 from mutagen.services.auth_service import AuthService
 from mutagen.services.diff_service import DiffService
 from mutagen.services.apply_service import ApplyService
+from mutagen.services.usage_service import UsageService
 
 logger = get_logger("services")
 
 
-def get_ai_provider():
-    """Get the configured AI provider instance."""
+def get_ai_provider(
+    tracked: bool = False,
+    user_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    analysis_id: Optional[str] = None,
+):
+    """Get the configured AI provider instance, optionally wrapped with token tracking and reduction."""
     settings = get_settings()
 
-    if settings.ai_provider == AIProvider.FAKE:
+    if settings.ai_provider == AIProvider.GEMMA:
+        from mutagen.ai.gemma_provider import GemmaProvider
+        raw = GemmaProvider()
+    elif settings.ai_provider == AIProvider.FAKE:
         from mutagen.ai.fake_provider import FakeProvider
-        return FakeProvider()
+        raw = FakeProvider()
     elif settings.ai_provider == AIProvider.GROQ:
         from mutagen.ai.groq_provider import GroqProvider
-        return GroqProvider()
+        raw = GroqProvider()
     elif settings.ai_provider == AIProvider.GEMINI:
         from mutagen.ai.gemini_provider import GeminiProvider
-        return GeminiProvider()
+        raw = GeminiProvider()
     else:
         raise MutagenConfigError(f"Unknown AI provider: {settings.ai_provider}")
+
+    if tracked:
+        from mutagen.ai.tracker import TrackedAIProvider
+        return TrackedAIProvider(
+            raw,
+            user_id=user_id,
+            project_id=project_id,
+            analysis_id=analysis_id,
+        )
+    return raw
+
+
+def get_tracked_ai_provider(
+    user_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    analysis_id: Optional[str] = None,
+):
+    """Convenience accessor for a tracked & token-optimized AI provider."""
+    return get_ai_provider(
+        tracked=True,
+        user_id=user_id,
+        project_id=project_id,
+        analysis_id=analysis_id,
+    )
 
 
 class AnalysisService:
@@ -90,6 +123,29 @@ class AnalysisService:
                 syntax_valid=True,
                 warnings=["Full analysis not available for this language"],
             )
+
+    def analyze_with_ai(
+        self,
+        file_path: str,
+        objective: OptimizationObjective = OptimizationObjective.BALANCED,
+        user_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+    ) -> dict:
+        """Analyze a source file with static AST parsing combined with AI model analysis."""
+        static_analysis = self.analyze_file(file_path)
+        path = Path(file_path).resolve()
+        content = path.read_text(encoding="utf-8")
+        ai = get_tracked_ai_provider(user_id=user_id, project_id=project_id)
+        ai_result = ai.analyze_code(
+            source_code=content,
+            language=static_analysis.language.value,
+            objective=objective,
+            static_context=static_analysis.model_dump(),
+        )
+        return {
+            "static_analysis": static_analysis.model_dump(),
+            "ai_analysis": ai_result,
+        }
 
 
 class ProjectService:
@@ -326,7 +382,11 @@ class ExperimentService:
                 is_eligible=cand.is_eligible,
                 context=context,
             )
-            return report.model_dump()
+            res = report.model_dump()
+            res["verification_passed"] = cand.verification_passed
+            res["verification_verdict"] = cand.verification_verdict
+            res["verification_json"] = cand.verification_json
+            return res
 
     def list_candidates(self, experiment_id: str, user_id: Optional[str] = None) -> list[dict]:
         """List all candidates for an experiment if authorized."""
@@ -365,6 +425,9 @@ class ExperimentService:
             "explanation": cand.explanation,
             "validation_passed": cand.validation_passed,
             "tests_passed": cand.tests_passed,
+            "verification_passed": cand.verification_passed,
+            "verification_verdict": cand.verification_verdict,
+            "verification_json": cand.verification_json,
             "fitness_score": cand.fitness_score,
             "speed_improvement": cand.speed_improvement,
             "memory_improvement": cand.memory_improvement,

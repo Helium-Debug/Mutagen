@@ -282,6 +282,11 @@ class MutationCandidate(TimestampMixin, Base):
     memory_improvement: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     is_eligible: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    # Verification
+    verification_passed: Mapped[bool] = mapped_column(Boolean, default=False)
+    verification_verdict: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    verification_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
     # Relationships
     experiment: Mapped["Experiment"] = relationship(back_populates="candidates")
     diffs: Mapped[list["SourceDiff"]] = relationship(
@@ -361,21 +366,92 @@ class AIUsageRecord(TimestampMixin, Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     user_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    project_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     experiment_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    analysis_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    candidate_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    generation_number: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    attempt_number: Mapped[int] = mapped_column(Integer, default=1)
     provider: Mapped[str] = mapped_column(String(50), nullable=False)
     model: Mapped[str] = mapped_column(String(100), nullable=False)
     operation: Mapped[str] = mapped_column(String(100), nullable=False)
-    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
-    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
-    total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    input_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    total_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    cached_input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    estimated_input_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    estimated_output_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    estimated_total_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    usage_source: Mapped[str] = mapped_column(String(50), default="provider_reported")
+    request_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, unique=True)
+    status: Mapped[str] = mapped_column(String(50), default="success")
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0)
     duration_ms: Mapped[int] = mapped_column(Integer, default=0)
     success: Mapped[bool] = mapped_column(Boolean, default=True)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
     __table_args__ = (
         Index("ix_ai_usage_user", "user_id"),
+        Index("ix_ai_usage_project", "project_id"),
         Index("ix_ai_usage_experiment", "experiment_id"),
+        Index("ix_ai_usage_analysis", "analysis_id"),
         Index("ix_ai_usage_provider", "provider"),
+        Index("ix_ai_usage_operation", "operation"),
+        Index("ix_ai_usage_request_id", "request_id"),
+    )
+
+
+class CacheEventRecord(TimestampMixin, Base):
+    """Tracks cache events and token optimization savings."""
+    __tablename__ = "cache_event_records"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    project_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    analysis_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    experiment_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    operation: Mapped[str] = mapped_column(String(100), nullable=False)
+    cache_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    cache_hit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    ai_requests_avoided: Mapped[int] = mapped_column(Integer, default=1)
+    estimated_tokens_avoided: Mapped[int] = mapped_column(Integer, default=0)
+    savings_baseline: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    reused_record_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    metadata_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
+    __table_args__ = (
+        Index("ix_cache_event_user", "user_id"),
+        Index("ix_cache_event_project", "project_id"),
+        Index("ix_cache_event_operation", "operation"),
+        Index("ix_cache_event_type", "cache_type"),
+        Index("ix_cache_event_hit", "cache_hit"),
+    )
+
+
+class AnalysisCacheRecord(TimestampMixin, Base):
+    """Persistent cache for exact and incremental analysis and mutation results."""
+    __tablename__ = "analysis_cache_records"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    project_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    operation: Mapped[str] = mapped_column(String(100), nullable=False)
+    language: Mapped[str] = mapped_column(String(50), nullable=False, default="python")
+    objective: Mapped[str] = mapped_column(String(50), nullable=False, default="balanced")
+    symbol_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    result_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    input_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    total_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    metadata_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
+    __table_args__ = (
+        Index("ix_analysis_cache_hash", "content_hash"),
+        Index("ix_analysis_cache_op", "operation"),
+        Index("ix_analysis_cache_user", "user_id"),
+        Index("ix_analysis_cache_project", "project_id"),
     )
 
 

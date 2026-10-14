@@ -89,3 +89,49 @@ def test_calculate_improvement():
 
     imp_slower = calculate_improvement(baseline=10.0, candidate=15.0)
     assert imp_slower == -50.0
+
+
+def test_fitness_evaluator_verification_verdicts():
+    evaluator = FitnessEvaluator(objective=OptimizationObjective.SPEED)
+    validation = ValidationResult(candidate_id="cand_verif", is_valid=True)
+
+    class MockReport:
+        def __init__(self, verdict, reasons=None):
+            self.final_verdict = verdict
+            self.rejection_reasons = reasons or []
+
+    # ACCEPT verdict
+    score_accept = evaluator.evaluate(
+        candidate_id="cand_accept",
+        validation=validation,
+        test_result=None,
+        benchmark=None,
+        baseline_benchmark=None,
+        verification_report=MockReport("ACCEPT"),
+    )
+    assert score_accept.is_eligible is True
+    assert score_accept.correctness_score == 1.0
+
+    # REVIEW verdict
+    score_review = evaluator.evaluate(
+        candidate_id="cand_review",
+        validation=validation,
+        test_result=None,
+        benchmark=None,
+        baseline_benchmark=None,
+        verification_report=MockReport("REVIEW"),
+    )
+    assert score_review.is_eligible is True
+    assert score_review.correctness_score == 0.95
+
+    # REJECT verdict
+    score_reject = evaluator.evaluate(
+        candidate_id="cand_reject",
+        validation=validation,
+        test_result=None,
+        benchmark=None,
+        baseline_benchmark=None,
+        verification_report=MockReport("REJECT", reasons=["Division by zero"]),
+    )
+    assert score_reject.is_eligible is False
+    assert score_reject.correctness_score == 0.0

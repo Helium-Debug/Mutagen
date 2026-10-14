@@ -6,16 +6,18 @@ Provides CRUD operations and access control isolation for all persistent entitie
 
 from __future__ import annotations
 
-from typing import Optional
+from datetime import datetime
+from typing import Any, Optional
 
-from sqlalchemy import select, desc, func, or_
+from sqlalchemy import select, desc, func, or_, and_, case
 from sqlalchemy.orm import Session
 
-from mutagen.core.identifiers import generate_id, utc_now
+from mutagen.core.identifiers import generate_id, generate_mutation_id, utc_now
 from mutagen.models import (
     User, RefreshToken, Project, ProjectFile, CodeVersion, Experiment,
     ExperimentGeneration, MutationCandidate, SourceDiff, MemoryRecord,
     AIUsageRecord, OptimizationCertificateRecord, AuditEvent,
+    CacheEventRecord, AnalysisCacheRecord,
 )
 
 
@@ -363,7 +365,10 @@ class CandidateRepository:
         self.session = session
 
     def create(self, **kwargs) -> MutationCandidate:
-        candidate = MutationCandidate(id=kwargs.pop("id", generate_id()), **kwargs)
+        cand_id = kwargs.pop("id", None) or generate_mutation_id()
+        if self.session.get(MutationCandidate, cand_id) is not None:
+            cand_id = generate_mutation_id()
+        candidate = MutationCandidate(id=cand_id, **kwargs)
         self.session.add(candidate)
         self.session.flush()
         return candidate
@@ -407,27 +412,60 @@ class CandidateRepository:
         status: str,
         **kwargs,
     ) -> Optional[MutationCandidate]:
-        cand = self.get(candidate_id)
-        if cand:
-            cand.status = status
-            for k, v in kwargs.items():
-                if hasattr(cand, k):
-                    setattr(cand, k, v)
-            self.session.flush()
-        return cand
+        try:
+            cand = self.get(candidate_id)
+            if cand:
+                cand.status = status
+                for k, v in kwargs.items():
+                    if hasattr(cand, k):
+                        setattr(cand, k, v)
+                self.session.flush()
+            return cand
+        except Exception as e:
+            logger.warning(
+                f"Failed to flush candidate {candidate_id} status ({e}); retrying with recovered connection."
+            )
+            try:
+                self.session.rollback()
+            except Exception:
+                pass
+            cand = self.get(candidate_id)
+            if cand:
+                cand.status = status
+                for k, v in kwargs.items():
+                    if hasattr(cand, k):
+                        setattr(cand, k, v)
+                self.session.flush()
+            return cand
 
     def update_results(
         self,
         candidate_id: str,
         **kwargs,
     ) -> Optional[MutationCandidate]:
-        cand = self.get(candidate_id)
-        if cand:
-            for k, v in kwargs.items():
-                if hasattr(cand, k):
-                    setattr(cand, k, v)
-            self.session.flush()
-        return cand
+        try:
+            cand = self.get(candidate_id)
+            if cand:
+                for k, v in kwargs.items():
+                    if hasattr(cand, k):
+                        setattr(cand, k, v)
+                self.session.flush()
+            return cand
+        except Exception as e:
+            logger.warning(
+                f"Failed to flush candidate {candidate_id} results ({e}); retrying with recovered connection."
+            )
+            try:
+                self.session.rollback()
+            except Exception:
+                pass
+            cand = self.get(candidate_id)
+            if cand:
+                for k, v in kwargs.items():
+                    if hasattr(cand, k):
+                        setattr(cand, k, v)
+                self.session.flush()
+            return cand
 
 
 
@@ -537,16 +575,205 @@ class MemoryRepository:
 
 
 class AIUsageRepository:
-    """Repository for AI usage tracking."""
+    """Repository for AI usage tracking and token metrics."""
 
     def __init__(self, session: Session):
         self.session = session
 
     def create(self, **kwargs) -> AIUsageRecord:
+        request_id = kwargs.get("request_id")
+        if request_id:
+            existing = self.get_by_request_id(request_id)
+            if existing:
+                return existing
+
+        # Sync legacy & new status/latency fields
+        if "duration_ms" in kwargs and "latency_ms" not in kwargs:
+            kwargs["latency_ms"] = kwargs["duration_ms"]
+        elif "latency_ms" in kwargs and "duration_ms" not in kwargs:
+            kwargs["duration_ms"] = kwargs["latency_ms"]
+
+        if "status" in kwargs and "success" not in kwargs:
+            kwargs["success"] = (kwargs["status"] == "success")
+        elif "success" in kwargs and "status" not in kwargs:
+            kwargs["status"] = "success" if kwargs["success"] else "failed"
+
+        # Safe defaults for required non-null string fields
+        if not kwargs.get("provider"):
+            kwargs["provider"] = "default"
+        if not kwargs.get("model"):
+            kwargs["model"] = "default"
+        if not kwargs.get("operation"):
+            kwargs["operation"] = "general"
+
         record = AIUsageRecord(id=kwargs.pop("id", generate_id()), **kwargs)
         self.session.add(record)
         self.session.flush()
         return record
+
+    def record_usage(self, **kwargs) -> AIUsageRecord:
+        """Alias for create to support standard usage tracking nomenclature."""
+        return self.create(**kwargs)
+
+    def get_by_request_id(self, request_id: str) -> Optional[AIUsageRecord]:
+        stmt = select(AIUsageRecord).where(AIUsageRecord.request_id == request_id)
+        return self.session.execute(stmt).scalar_one_or_none()
+
+    def query_records(
+        self,
+        user_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        operation: Optional[str] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> list[AIUsageRecord]:
+        stmt = select(AIUsageRecord)
+        if user_id:
+            stmt = stmt.where(or_(AIUsageRecord.user_id == user_id, AIUsageRecord.user_id.is_(None)))
+        if project_id:
+            stmt = stmt.where(AIUsageRecord.project_id == project_id)
+        if since:
+            stmt = stmt.where(AIUsageRecord.created_at >= since)
+        if until:
+            stmt = stmt.where(AIUsageRecord.created_at <= until)
+        if operation:
+            stmt = stmt.where(func.lower(AIUsageRecord.operation) == operation.lower())
+        if provider:
+            stmt = stmt.where(func.lower(AIUsageRecord.provider) == provider.lower())
+        if model:
+            stmt = stmt.where(func.lower(AIUsageRecord.model) == model.lower())
+        if status:
+            stmt = stmt.where(func.lower(AIUsageRecord.status) == status.lower())
+
+        stmt = stmt.order_by(desc(AIUsageRecord.created_at)).offset(offset).limit(limit)
+        return list(self.session.execute(stmt).scalars().all())
+
+    def count_records(
+        self,
+        user_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        operation: Optional[str] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> int:
+        stmt = select(func.count(AIUsageRecord.id))
+        if user_id:
+            stmt = stmt.where(or_(AIUsageRecord.user_id == user_id, AIUsageRecord.user_id.is_(None)))
+        if project_id:
+            stmt = stmt.where(AIUsageRecord.project_id == project_id)
+        if since:
+            stmt = stmt.where(AIUsageRecord.created_at >= since)
+        if until:
+            stmt = stmt.where(AIUsageRecord.created_at <= until)
+        if operation:
+            stmt = stmt.where(func.lower(AIUsageRecord.operation) == operation.lower())
+        if provider:
+            stmt = stmt.where(func.lower(AIUsageRecord.provider) == provider.lower())
+        if model:
+            stmt = stmt.where(func.lower(AIUsageRecord.model) == model.lower())
+        if status:
+            stmt = stmt.where(func.lower(AIUsageRecord.status) == status.lower())
+
+        return self.session.execute(stmt).scalar() or 0
+
+    def aggregate_usage(
+        self,
+        user_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        operation: Optional[str] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> dict[str, Any]:
+        stmt = select(
+            func.count(AIUsageRecord.id).label("total_requests"),
+            func.sum(
+                case(
+                    (or_(AIUsageRecord.status == "success", AIUsageRecord.success.is_(True)), 1),
+                    else_=0,
+                )
+            ).label("successful_requests"),
+            func.sum(
+                case(
+                    (or_(AIUsageRecord.status == "failed", AIUsageRecord.success.is_(False)), 1),
+                    else_=0,
+                )
+            ).label("failed_requests"),
+            func.sum(
+                case(
+                    (AIUsageRecord.usage_source == "provider_reported", AIUsageRecord.input_tokens),
+                    else_=0,
+                )
+            ).label("actual_input_tokens"),
+            func.sum(
+                case(
+                    (AIUsageRecord.usage_source == "provider_reported", AIUsageRecord.output_tokens),
+                    else_=0,
+                )
+            ).label("actual_output_tokens"),
+            func.sum(
+                case(
+                    (AIUsageRecord.usage_source == "provider_reported", AIUsageRecord.total_tokens),
+                    else_=0,
+                )
+            ).label("actual_total_tokens"),
+            func.sum(AIUsageRecord.cached_input_tokens).label("cached_input_tokens"),
+            func.sum(
+                case(
+                    (AIUsageRecord.usage_source == "estimated", AIUsageRecord.estimated_total_tokens),
+                    else_=0,
+                )
+            ).label("estimated_total_tokens"),
+            func.sum(
+                case(
+                    (
+                        or_(
+                            AIUsageRecord.usage_source == "unavailable",
+                            AIUsageRecord.total_tokens.is_(None),
+                        ),
+                        1,
+                    ),
+                    else_=0,
+                )
+            ).label("unavailable_measurements"),
+        )
+
+        if user_id:
+            stmt = stmt.where(or_(AIUsageRecord.user_id == user_id, AIUsageRecord.user_id.is_(None)))
+        if project_id:
+            stmt = stmt.where(AIUsageRecord.project_id == project_id)
+        if since:
+            stmt = stmt.where(AIUsageRecord.created_at >= since)
+        if until:
+            stmt = stmt.where(AIUsageRecord.created_at <= until)
+        if operation:
+            stmt = stmt.where(func.lower(AIUsageRecord.operation) == operation.lower())
+        if provider:
+            stmt = stmt.where(func.lower(AIUsageRecord.provider) == provider.lower())
+        if model:
+            stmt = stmt.where(func.lower(AIUsageRecord.model) == model.lower())
+
+        row = self.session.execute(stmt).one()
+        return {
+            "total_requests": row[0] or 0,
+            "successful_requests": row[1] or 0,
+            "failed_requests": row[2] or 0,
+            "actual_input_tokens": row[3] or 0,
+            "actual_output_tokens": row[4] or 0,
+            "actual_total_tokens": row[5] or 0,
+            "cached_input_tokens": row[6] or 0,
+            "estimated_total_tokens": row[7] or 0,
+            "unavailable_measurements": row[8] or 0,
+        }
 
     def total_for_experiment(self, experiment_id: str) -> dict[str, int]:
         stmt = (
@@ -565,6 +792,273 @@ class AIUsageRepository:
             "total_tokens": row[2] or 0,
             "requests": row[3] or 0,
         }
+
+
+class CacheEventRepository:
+    """Repository for cache event tracking and optimization savings."""
+
+    def __init__(self, session: Session):
+        self.session = session
+
+    def create(self, **kwargs) -> CacheEventRecord:
+        # Prevent duplicate savings for identical analysis & reused record
+        reused_record_id = kwargs.get("reused_record_id")
+        analysis_id = kwargs.get("analysis_id")
+        operation = kwargs.get("operation")
+        if reused_record_id and analysis_id and operation:
+            existing = self.find_existing(analysis_id, reused_record_id, operation)
+            if existing:
+                return existing
+
+        record = CacheEventRecord(id=kwargs.pop("id", generate_id()), **kwargs)
+        self.session.add(record)
+        self.session.flush()
+        return record
+
+    def find_existing(
+        self,
+        analysis_id: str,
+        reused_record_id: str,
+        operation: str,
+    ) -> Optional[CacheEventRecord]:
+        stmt = select(CacheEventRecord).where(
+            CacheEventRecord.analysis_id == analysis_id,
+            CacheEventRecord.reused_record_id == reused_record_id,
+            CacheEventRecord.operation == operation,
+        )
+        return self.session.execute(stmt).scalar_one_or_none()
+
+    def aggregate_cache_stats(
+        self,
+        user_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        operation: Optional[str] = None,
+    ) -> dict[str, Any]:
+        stmt = select(
+            func.count(CacheEventRecord.id).label("total_lookups"),
+            func.sum(
+                case((CacheEventRecord.cache_hit.is_(True), 1), else_=0)
+            ).label("cache_hits"),
+            func.sum(
+                case((CacheEventRecord.cache_hit.is_(False), 1), else_=0)
+            ).label("cache_misses"),
+            func.sum(
+                case(
+                    (
+                        and_(
+                            CacheEventRecord.cache_hit.is_(True),
+                            CacheEventRecord.cache_type == "incremental_analysis",
+                        ),
+                        1,
+                    ),
+                    else_=0,
+                )
+            ).label("incremental_analyses"),
+            func.sum(
+                case(
+                    (CacheEventRecord.cache_hit.is_(True), CacheEventRecord.ai_requests_avoided),
+                    else_=0,
+                )
+            ).label("ai_requests_avoided"),
+            func.sum(
+                case(
+                    (CacheEventRecord.cache_hit.is_(True), CacheEventRecord.estimated_tokens_avoided),
+                    else_=0,
+                )
+            ).label("estimated_tokens_saved"),
+        )
+
+        if user_id:
+            stmt = stmt.where(or_(CacheEventRecord.user_id == user_id, CacheEventRecord.user_id.is_(None)))
+        if project_id:
+            stmt = stmt.where(CacheEventRecord.project_id == project_id)
+        if since:
+            stmt = stmt.where(CacheEventRecord.created_at >= since)
+        if until:
+            stmt = stmt.where(CacheEventRecord.created_at <= until)
+        if operation:
+            stmt = stmt.where(func.lower(CacheEventRecord.operation) == operation.lower())
+
+        row = self.session.execute(stmt).one()
+        total_lookups = row[0] or 0
+        cache_hits = row[1] or 0
+        cache_misses = row[2] or 0
+        incremental_analyses = row[3] or 0
+        ai_requests_avoided = row[4] or 0
+        estimated_tokens_saved = row[5] or 0
+
+        hit_rate = (cache_hits / total_lookups * 100.0) if total_lookups > 0 else 0.0
+
+        return {
+            "total_lookups": total_lookups,
+            "cache_hits": cache_hits,
+            "cache_misses": cache_misses,
+            "incremental_analyses": incremental_analyses,
+            "ai_requests_avoided": ai_requests_avoided,
+            "estimated_tokens_saved": estimated_tokens_saved,
+            "cache_hit_rate": hit_rate,
+        }
+
+    def query_events(
+        self,
+        user_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        operation: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[CacheEventRecord]:
+        stmt = select(CacheEventRecord)
+        if user_id:
+            stmt = stmt.where(or_(CacheEventRecord.user_id == user_id, CacheEventRecord.user_id.is_(None)))
+        if project_id:
+            stmt = stmt.where(CacheEventRecord.project_id == project_id)
+        if since:
+            stmt = stmt.where(CacheEventRecord.created_at >= since)
+        if until:
+            stmt = stmt.where(CacheEventRecord.created_at <= until)
+        if operation:
+            stmt = stmt.where(func.lower(CacheEventRecord.operation) == operation.lower())
+
+        stmt = stmt.order_by(desc(CacheEventRecord.created_at)).offset(offset).limit(limit)
+        return list(self.session.execute(stmt).scalars().all())
+
+    def get_savings_breakdown(
+        self,
+        user_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        operation: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Group savings by cache_type with hits, misses, requests avoided, and tokens avoided."""
+        stmt = select(
+            CacheEventRecord.cache_type,
+            func.count(CacheEventRecord.id).label("total_lookups"),
+            func.sum(case((CacheEventRecord.cache_hit.is_(True), 1), else_=0)).label("hits"),
+            func.sum(case((CacheEventRecord.cache_hit.is_(False), 1), else_=0)).label("misses"),
+            func.sum(case((CacheEventRecord.cache_hit.is_(True), CacheEventRecord.ai_requests_avoided), else_=0)).label("requests_avoided"),
+            func.sum(case((CacheEventRecord.cache_hit.is_(True), CacheEventRecord.estimated_tokens_avoided), else_=0)).label("tokens_avoided"),
+        ).group_by(CacheEventRecord.cache_type)
+
+        if user_id:
+            stmt = stmt.where(or_(CacheEventRecord.user_id == user_id, CacheEventRecord.user_id.is_(None)))
+        if project_id:
+            stmt = stmt.where(CacheEventRecord.project_id == project_id)
+        if since:
+            stmt = stmt.where(CacheEventRecord.created_at >= since)
+        if until:
+            stmt = stmt.where(CacheEventRecord.created_at <= until)
+        if operation:
+            stmt = stmt.where(func.lower(CacheEventRecord.operation) == operation.lower())
+
+        rows = self.session.execute(stmt).all()
+        return [
+            {
+                "cache_type": r[0],
+                "total_lookups": r[1] or 0,
+                "hits": r[2] or 0,
+                "misses": r[3] or 0,
+                "requests_avoided": r[4] or 0,
+                "tokens_avoided": r[5] or 0,
+            }
+            for r in rows
+        ]
+
+
+class AnalysisCacheRepository:
+    """Repository for exact and incremental analysis cache records."""
+
+    def __init__(self, session: Session):
+        self.session = session
+
+    def get_exact(
+        self,
+        content_hash: str,
+        operation: str,
+        language: str = "python",
+        objective: str = "balanced",
+        symbol_name: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> Optional[AnalysisCacheRecord]:
+        stmt = select(AnalysisCacheRecord).where(
+            AnalysisCacheRecord.content_hash == content_hash,
+            func.lower(AnalysisCacheRecord.operation) == operation.lower(),
+            func.lower(AnalysisCacheRecord.language) == language.lower(),
+            func.lower(AnalysisCacheRecord.objective) == objective.lower(),
+        )
+        if symbol_name:
+            stmt = stmt.where(AnalysisCacheRecord.symbol_name == symbol_name)
+        else:
+            stmt = stmt.where(AnalysisCacheRecord.symbol_name.is_(None))
+
+        if user_id:
+            stmt = stmt.where(
+                or_(
+                    AnalysisCacheRecord.user_id == user_id,
+                    AnalysisCacheRecord.user_id.is_(None),
+                )
+            )
+
+        return self.session.execute(stmt).scalar_one_or_none()
+
+    def store(
+        self,
+        content_hash: str,
+        operation: str,
+        result_json: dict,
+        language: str = "python",
+        objective: str = "balanced",
+        symbol_name: Optional[str] = None,
+        user_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        input_tokens: Optional[int] = None,
+        output_tokens: Optional[int] = None,
+        total_tokens: Optional[int] = None,
+        metadata_json: Optional[dict] = None,
+    ) -> AnalysisCacheRecord:
+        existing = self.get_exact(
+            content_hash=content_hash,
+            operation=operation,
+            language=language,
+            objective=objective,
+            symbol_name=symbol_name,
+            user_id=user_id,
+        )
+        if existing:
+            existing.result_json = result_json
+            if input_tokens is not None:
+                existing.input_tokens = input_tokens
+            if output_tokens is not None:
+                existing.output_tokens = output_tokens
+            if total_tokens is not None:
+                existing.total_tokens = total_tokens
+            if metadata_json:
+                existing.metadata_json = metadata_json
+            self.session.flush()
+            return existing
+
+        record = AnalysisCacheRecord(
+            id=generate_id(),
+            user_id=user_id,
+            project_id=project_id,
+            content_hash=content_hash,
+            operation=operation,
+            language=language,
+            objective=objective,
+            symbol_name=symbol_name,
+            result_json=result_json,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            metadata_json=metadata_json,
+        )
+        self.session.add(record)
+        self.session.flush()
+        return record
 
 
 class CertificateRepository:

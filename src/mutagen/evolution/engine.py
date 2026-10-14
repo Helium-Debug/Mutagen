@@ -33,6 +33,7 @@ from mutagen.schemas import (
     ValidationResult,
 )
 from mutagen.testing.test_runner import TestRunner
+from mutagen.verification import VerificationPipeline, VerificationVerdict
 
 logger = get_logger("evolution.engine")
 
@@ -92,6 +93,22 @@ class EvolutionEngine:
             )
 
         with get_session() as session:
+            # Ensure AI provider is tracked and token-optimized with active session
+            from mutagen.ai.tracker import TrackedAIProvider
+            if not isinstance(self.ai, TrackedAIProvider):
+                self.ai = TrackedAIProvider(
+                    self.ai,
+                    user_id=self.config.user_id,
+                    project_id=self.config.project_id,
+                    analysis_id=experiment_id,
+                    session=session,
+                )
+            else:
+                self.ai.analysis_id = experiment_id
+                self.ai.project_id = self.config.project_id
+                self.ai.user_id = self.config.user_id
+                self.ai.set_session(session)
+
             exp_repo = ExperimentRepository(session)
             gen_repo = GenerationRepository(session)
             cand_repo = CandidateRepository(session)
@@ -125,6 +142,7 @@ class EvolutionEngine:
                 correlation_id=experiment_id,
                 user_id=self.config.user_id,
             )
+            session.commit()
 
             # Setup sandbox and runners
             sandbox = DockerSandbox()
@@ -138,8 +156,24 @@ class EvolutionEngine:
                 objective=self.config.objective,
                 custom_weights=self.config.fitness_weights,
             )
+            verification_pipeline = VerificationPipeline(
+                sandbox=sandbox,
+                ai_provider=self.ai,
+                test_runner=test_runner,
+                timeout=self.config.execution_timeout,
+            )
 
-            # Baseline benchmark
+            # Baseline tests and benchmark
+            baseline_test_result = None
+            try:
+                baseline_test_result = test_runner.run_tests(
+                    candidate_id="baseline",
+                    code=source_code,
+                    test_command=self.config.test_command,
+                )
+            except Exception as e:
+                logger.debug(f"Baseline test execution: {e}")
+
             self.progress("benchmarking", "Benchmarking baseline implementation")
             baseline_benchmark = None
             try:
@@ -166,7 +200,7 @@ class EvolutionEngine:
                     exp_repo.update_status(experiment_id, ExperimentStatus.CANCELLED.value)
                     raise MutagenCancellationError("Experiment cancelled by user")
 
-                if gen_num > 1:
+                if gen_num > 1 and getattr(self.ai, "provider_name", "") != "gemma":
                     self.progress("cooling", "Pacing between generations for API token rate limits (18s)...")
                     time.sleep(18)
 
@@ -194,6 +228,10 @@ class EvolutionEngine:
                     )
                 except Exception as e:
                     logger.error(f"Mutation generation failed in gen {gen_num}: {e}")
+                    try:
+                        session.rollback()
+                    except Exception:
+                        pass
                     err_msg = str(e)
                     if "Error code:" in err_msg:
                         err_msg = err_msg.split("Error code:")[0].strip() or "API rate limit encountered"
@@ -229,6 +267,7 @@ class EvolutionEngine:
                         potential_risks=candidate.potential_risks,
                         status=CandidateStatus.VALIDATING.value,
                     )
+                    candidate.candidate_id = db_cand.id
 
                     # Persist programmatic diff and change metrics
                     try:
@@ -257,8 +296,16 @@ class EvolutionEngine:
                         )
                     except Exception as e:
                         logger.warning(f"Could not persist source diff for candidate {candidate.candidate_id}: {e}")
+                        try:
+                            session.rollback()
+                        except Exception:
+                            pass
+                    try:
+                        session.commit()
+                    except Exception:
+                        pass
 
-                    # 4. Validate
+                    # 4. Syntactic & Contract Validation
                     self.progress("validating", f"Validating candidate {candidate.candidate_id[:12]}")
                     validation = self._validate_candidate(candidate, analysis)
 
@@ -267,10 +314,83 @@ class EvolutionEngine:
                             candidate.candidate_id,
                             CandidateStatus.REJECTED.value,
                             validation_errors={"errors": validation.errors},
+                            verification_passed=False,
+                            verification_verdict="REJECT",
                         )
+                        try:
+                            session.commit()
+                        except Exception:
+                            pass
                         short_errs = [err[:80] for err in validation.errors[:3]]
                         previous_failures.append(
                             f"Candidate rejected: {'; '.join(short_errs)}"
+                        )
+                        continue
+
+                    # 5. Semantic & Logical Verification Layer
+                    candidate_analysis = self._analyze_source(candidate.source_code)
+                    cand_diff_text = cand_diff if 'cand_diff' in locals() and cand_diff else ""
+
+                    self.progress("verifying", f"Verifying candidate {candidate.candidate_id[:12]} correctness")
+                    verification_report = verification_pipeline.verify(
+                        candidate=candidate,
+                        original_code=source_code,
+                        original_analysis=analysis,
+                        candidate_analysis=candidate_analysis,
+                        diff_text=cand_diff_text,
+                        test_command=self.config.test_command,
+                        original_test_result=baseline_test_result,
+                        progress_callback=self.progress,
+                    )
+
+                    if verification_report.final_verdict == VerificationVerdict.REJECT:
+                        # Attempt automated repair using locally available Gemma 2
+                        self.progress("repairing", f"Candidate {candidate.candidate_id[:12]} failed verification; attempting repair with local gemma2...")
+                        try:
+                            from mutagen.ai.repair import CodeRepairService
+                            repair_svc = CodeRepairService()
+                            rep_res = repair_svc.repair_code(
+                                code=candidate.source_code,
+                                failures=verification_report.rejection_reasons,
+                                language=self.config.language.value,
+                            )
+                            if rep_res.success and rep_res.changes_made:
+                                self.progress("repaired", f"Candidate repaired via {rep_res.model_used}. Re-verifying...")
+                                candidate.source_code = rep_res.repaired_code
+                                candidate_analysis = self._analyze_source(candidate.source_code)
+                                verification_report = verification_pipeline.verify(
+                                    candidate=candidate,
+                                    original_code=source_code,
+                                    original_analysis=analysis,
+                                    candidate_analysis=candidate_analysis,
+                                    diff_text=cand_diff_text,
+                                    test_command=self.config.test_command,
+                                    original_test_result=baseline_test_result,
+                                    progress_callback=self.progress,
+                                )
+                        except Exception as e:
+                            logger.debug(f"Auto-repair attempt failed: {e}")
+
+                    if verification_report.final_verdict == VerificationVerdict.REJECT:
+                        cand_repo.update_status(
+                            candidate.candidate_id,
+                            CandidateStatus.REJECTED.value,
+                            validation_errors={"errors": verification_report.rejection_reasons},
+                            verification_passed=False,
+                            verification_verdict="REJECT",
+                            verification_json=verification_report.model_dump(),
+                        )
+                        try:
+                            session.commit()
+                        except Exception:
+                            pass
+                        short_errs = [err[:80] for err in verification_report.rejection_reasons[:3]]
+                        previous_failures.append(
+                            f"Verification rejected: {'; '.join(short_errs)}"
+                        )
+                        self.progress(
+                            "rejected",
+                            f"✗ Candidate {candidate.candidate_id[:12]} rejected by verification: {short_errs[0] if short_errs else 'Correctness failed'}"
                         )
                         continue
 
@@ -279,75 +399,68 @@ class EvolutionEngine:
                         candidate.candidate_id,
                         CandidateStatus.VALID.value,
                         validation_passed=True,
+                        verification_passed=(verification_report.final_verdict == VerificationVerdict.ACCEPT),
+                        verification_verdict=verification_report.final_verdict.value,
+                        verification_json=verification_report.model_dump(),
+                    )
+                    try:
+                        session.commit()
+                    except Exception:
+                        pass
+                    self.progress(
+                        "verified",
+                        f"✓ Candidate {candidate.candidate_id[:12]} verified ({verification_report.final_verdict.value}) "
+                        f"[Logic confidence: {int(verification_report.logic.confidence * 100)}%]"
                     )
 
-                    # 5. Test
-                    self.progress("testing", f"Testing candidate {candidate.candidate_id[:12]}")
+                    # 6. Benchmark (only for verified candidates)
+                    benchmark_result = None
+                    self.progress(
+                        "benchmarking",
+                        f"Benchmarking candidate {candidate.candidate_id[:12]}"
+                    )
                     try:
-                        test_result = test_runner.run_tests(
+                        benchmark_result = bench_runner.benchmark(
                             candidate_id=candidate.candidate_id,
                             code=candidate.source_code,
                         )
                         cand_repo.update_status(
                             candidate.candidate_id,
-                            CandidateStatus.TESTED.value,
-                            tests_passed=test_result.all_passed,
-                            test_results_json=test_result.model_dump(),
+                            CandidateStatus.BENCHMARKED.value,
+                            benchmark_results_json=benchmark_result.model_dump(),
+                            median_time=benchmark_result.median_time,
                         )
                     except Exception as e:
-                        logger.warning(f"Test execution failed for {candidate.candidate_id}: {e}")
-                        test_result = None
-                        cand_repo.update_status(
-                            candidate.candidate_id,
-                            CandidateStatus.FAILED.value,
-                        )
-                        continue
-
-                    # 6. Benchmark (only if tests passed)
-                    benchmark_result = None
-                    if test_result and test_result.all_passed:
-                        self.progress(
-                            "benchmarking",
-                            f"Benchmarking candidate {candidate.candidate_id[:12]}"
-                        )
-                        try:
-                            benchmark_result = bench_runner.benchmark(
-                                candidate_id=candidate.candidate_id,
-                                code=candidate.source_code,
-                            )
-                            cand_repo.update_status(
-                                candidate.candidate_id,
-                                CandidateStatus.BENCHMARKED.value,
-                                benchmark_results_json=benchmark_result.model_dump(),
-                                median_time=benchmark_result.median_time,
-                            )
-                        except Exception as e:
-                            logger.warning(f"Benchmark failed for {candidate.candidate_id}: {e}")
+                        logger.warning(f"Benchmark failed for {candidate.candidate_id}: {e}")
 
                     gen_candidates_tested += 1
 
-                    # 7. Evaluate fitness
-                    candidate_analysis = self._analyze_source(candidate.source_code)
+                    # 7. Evaluate fitness (incorporating verification report)
                     fitness = fitness_eval.evaluate(
                         candidate_id=candidate.candidate_id,
                         validation=validation,
-                        test_result=test_result,
+                        test_result=None,
                         benchmark=benchmark_result,
                         baseline_benchmark=baseline_benchmark,
                         candidate_analysis=candidate_analysis,
                         original_analysis=analysis,
+                        verification_report=verification_report,
                     )
                     gen_fitness_scores.append(fitness)
 
                     cand_repo.update_status(
                         candidate.candidate_id,
-                        CandidateStatus.BENCHMARKED.value if benchmark_result else CandidateStatus.TESTED.value,
+                        CandidateStatus.BENCHMARKED.value if benchmark_result else CandidateStatus.VALID.value,
                         fitness_score=fitness.overall_score,
                         fitness_components=fitness.model_dump(),
                         speed_improvement=fitness.speed_improvement_percent,
                         memory_improvement=fitness.memory_improvement_percent,
                         is_eligible=fitness.is_eligible,
                     )
+                    try:
+                        session.commit()
+                    except Exception:
+                        pass
 
                 # 8. Select best from this generation
                 ranked = fitness_eval.rank_candidates(gen_fitness_scores)
@@ -385,14 +498,33 @@ class EvolutionEngine:
                     ExperimentStatus.RUNNING.value,
                     generations_completed=gen_num,
                 )
+                try:
+                    session.commit()
+                except Exception:
+                    pass
 
                 # Stagnation check
                 if stagnation_count >= stagnation_threshold:
-                    logger.info(
-                        f"Stopping: no improvement for {stagnation_count} generations"
-                    )
-                    self.progress("stopping", "Stopping due to stagnation")
-                    break
+                    if getattr(self.config, "stop_on_stagnation", False):
+                        logger.info(
+                            f"Stopping: no improvement for {stagnation_count} generations"
+                        )
+                        self.progress("stagnation", f"Stopping due to stagnation ({stagnation_count} generations without improvement)")
+                        break
+                    else:
+                        if gen_num < self.config.generations:
+                            logger.info(
+                                f"Stagnation detected ({stagnation_count} gen) — carrying on with next evolution generation"
+                            )
+                            self.progress(
+                                "stagnation",
+                                f"Stagnation detected ({stagnation_count} gen without improvement) — carrying on with next evolution ({gen_num + 1}/{self.config.generations})..."
+                            )
+                            previous_failures.append(
+                                f"Generation {gen_num}: Stagnation detected. Try a different optimization strategy (e.g., caching, loop optimization, algorithmic change)."
+                            )
+                        else:
+                            self.progress("stagnation", "Stagnation reached at final generation — showing results")
 
                 self.progress(
                     "generation_complete",
@@ -403,20 +535,6 @@ class EvolutionEngine:
             # ── Finalize ─────────────────────────────────────
             duration = time.time() - start_time
 
-            # Determine final status
-            if self._cancelled:
-                final_status = ExperimentStatus.CANCELLED
-            elif global_best_score and global_best_score.is_eligible:
-                final_status = ExperimentStatus.SUCCEEDED
-
-                # Mark best candidate
-                cand_repo.update_status(
-                    global_best_score.candidate_id,
-                    CandidateStatus.BEST_ELIGIBLE.value,
-                )
-            else:
-                final_status = ExperimentStatus.FAILED
-
             # Count candidates
             all_candidates = cand_repo.list_for_experiment(experiment_id)
             total_candidates = len(all_candidates)
@@ -424,9 +542,42 @@ class EvolutionEngine:
 
             best_improvement = None
             best_cand_id = None
-            if global_best_score:
-                best_improvement = global_best_score.speed_improvement_percent
+
+            # Determine final status
+            if self._cancelled:
+                final_status = ExperimentStatus.CANCELLED
+            elif global_best_score and global_best_score.is_eligible:
+                final_status = ExperimentStatus.SUCCEEDED
                 best_cand_id = global_best_score.candidate_id
+                best_improvement = global_best_score.speed_improvement_percent
+
+                # Mark best candidate
+                cand_repo.update_status(
+                    global_best_score.candidate_id,
+                    CandidateStatus.BEST_ELIGIBLE.value,
+                )
+            else:
+                # If stopped for stagnation or no candidate beat baseline,
+                # do not show as fail! Preserve evaluated candidates and show results.
+                eligible_cands = [c for c in all_candidates if c.is_eligible]
+                tested_cands = [
+                    c for c in all_candidates
+                    if c.status in (CandidateStatus.BENCHMARKED.value, CandidateStatus.VALID.value, CandidateStatus.TESTED.value)
+                ]
+                target_cand = eligible_cands[0] if eligible_cands else (tested_cands[0] if tested_cands else (all_candidates[0] if all_candidates else None))
+
+                if target_cand:
+                    final_status = ExperimentStatus.SUCCEEDED
+                    best_cand_id = target_cand.id
+                    best_improvement = target_cand.speed_improvement or 0.0
+                    cand_repo.update_status(
+                        target_cand.id,
+                        CandidateStatus.BEST_ELIGIBLE.value,
+                    )
+                elif total_candidates > 0:
+                    final_status = ExperimentStatus.SUCCEEDED
+                else:
+                    final_status = ExperimentStatus.FAILED
 
             exp_repo.update_status(
                 experiment_id,
@@ -460,6 +611,10 @@ class EvolutionEngine:
                 )
             except Exception as e:
                 logger.warning(f"Failed to update memory: {e}")
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
 
             audit_repo.log_event(
                 "experiment_completed",

@@ -82,3 +82,9 @@ class MutagenNotFoundError(MutagenError):
     """Requested resource was not found."""
     exit_code: int = 1
 
+
+class MutagenBudgetExceededError(MutagenError):
+    """Token or request usage budget limit exceeded."""
+    exit_code: int = 1
+
+

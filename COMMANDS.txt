@@ -1,0 +1,383 @@
+================================================================================
+                    MUTAGEN CLI — COMPLETE COMMAND REFERENCE
+================================================================================
+The Experimental Evolution Engine for Code
+Core Philosophy: "AI proposes. MUTAGEN verifies. Memory learns. Code evolves."
+
+Invocation:
+  You can run commands using either:
+    mutagen <command> [arguments] [options]
+    python -m mutagen <command> [arguments] [options]
+
+================================================================================
+1. SYSTEM, HEALTH & DOCKER MANAGEMENT
+================================================================================
+
+mutagen doctor
+  Function:
+    Diagnose all system dependencies, configuration settings, and service status.
+    Checks Python version, package installation, AI provider & local Gemma server,
+    PostgreSQL database connection, Docker daemon reachability, Sandbox image,
+    and artifacts directory.
+  Syntax:
+    mutagen doctor
+  Example:
+    mutagen doctor
+
+--------------------------------------------------------------------------------
+
+mutagen docker
+  Function:
+    Check Docker engine status with colored terminal output:
+      - GREEN: Docker daemon is ON, reachable, and sandbox image is ready.
+      - RED:   Docker daemon is OFF (offline).
+    Automatically launches Docker Desktop if the engine is offline.
+    Inspects running background containers and manages Docker Compose services.
+  Syntax:
+    mutagen docker [OPTIONS]
+  Options:
+    --launch / --no-launch   Attempt to launch Docker if offline (default: --launch)
+    --wait, -w INTEGER       Seconds to wait for engine to initialize (default: 15)
+    --up                     Start background services (PostgreSQL & Redis) via Compose
+    --down                   Stop background services via Compose
+  Examples:
+    mutagen docker
+    mutagen docker --no-launch
+    mutagen docker --up
+    mutagen docker --down
+
+--------------------------------------------------------------------------------
+
+mutagen version
+  Function:
+    Display the current installed version and banner of MUTAGEN.
+  Syntax:
+    mutagen version
+
+--------------------------------------------------------------------------------
+
+mutagen init
+  Function:
+    Initialize MUTAGEN configuration in the current workspace by creating a
+    clean .env template pre-configured for local Gemma and Docker sandboxes.
+  Syntax:
+    mutagen init [OPTIONS]
+  Options:
+    --force, -f              Overwrite existing .env file if present
+  Example:
+    mutagen init
+    mutagen init --force
+
+
+================================================================================
+2. AUTHENTICATION & ACCOUNT MANAGEMENT
+================================================================================
+
+mutagen register
+  Function:
+    Create a new individual user account in the MUTAGEN database.
+  Syntax:
+    mutagen register [OPTIONS]
+  Options:
+    -u, --username TEXT      Desired username (interactive prompt if omitted)
+    -e, --email TEXT         Email address (interactive prompt if omitted)
+    -p, --password TEXT      Account password (secure prompt if omitted)
+  Example:
+    mutagen register -u alice -e alice@example.com -p "SecretPass123!"
+
+--------------------------------------------------------------------------------
+
+mutagen login
+  Function:
+    Authenticate with your MUTAGEN account and store a secure local session token.
+  Syntax:
+    mutagen login [OPTIONS]
+  Options:
+    -i, --identifier TEXT    Username or email address
+    -p, --password TEXT      Account password
+  Example:
+    mutagen login -i alice -p "SecretPass123!"
+
+--------------------------------------------------------------------------------
+
+mutagen whoami
+  Function:
+    Display information about the currently logged-in user, session token expiry,
+    and associated roles.
+  Syntax:
+    mutagen whoami
+
+--------------------------------------------------------------------------------
+
+mutagen account
+  Function:
+    Display detailed user account status, quotas, and cumulative resource usage.
+  Syntax:
+    mutagen account
+
+--------------------------------------------------------------------------------
+
+mutagen logout
+  Function:
+    End the current session and remove stored credentials from the local host.
+  Syntax:
+    mutagen logout
+
+
+================================================================================
+3. CODE ANALYSIS & INSPECTION
+================================================================================
+
+mutagen analyze <file_path>
+  Function:
+    Perform comprehensive AST static analysis on a source code file. Calculates:
+      - Line counts (code, comments, blanks)
+      - Syntax validity & errors
+      - Cyclomatic complexity
+      - Halstead complexity & maintainability index
+      - Function / class / interface symbols
+      - Time & space complexity estimates
+    When --ai is provided, queries the local Gemma model for deep structural
+    analysis, algorithmic bottlenecks, correctness invariants, and optimization
+    hypotheses.
+  Syntax:
+    mutagen analyze <file_path> [OPTIONS]
+  Options:
+    --ai                     Include AI-powered structural, bottleneck & proposal analysis
+    -v, --verbose            Show detailed AST breakdown
+    -f, --format TEXT        Output format: "text" or "json" (default: text)
+  Examples:
+    mutagen analyze examples/fibonacci.py
+    mutagen analyze examples/fibonacci.py --ai
+    mutagen analyze examples/ruyam.py --format json
+
+--------------------------------------------------------------------------------
+
+mutagen diff <candidate_id>
+  Function:
+    Display a colorized, line-by-line unified diff between the original source
+    and a specific mutation candidate.
+  Syntax:
+    mutagen diff <candidate_id> [OPTIONS]
+  Options:
+    --context, -c INTEGER    Number of context lines around changes (default: 3)
+  Example:
+    mutagen diff mut-fib-iter
+
+--------------------------------------------------------------------------------
+
+mutagen show <candidate_id_or_file>
+  Function:
+    Display complete source code with syntax highlighting for an original file
+    or generated candidate.
+  Syntax:
+    mutagen show <target>
+
+
+================================================================================
+4. SANDBOX TESTING & EVOLUTIONARY OPTIMIZATION
+================================================================================
+
+mutagen test <target>
+  Function:
+    Execute tests against source code inside an isolated, secure Docker sandbox
+    container (read-only filesystem, network disabled, CPU/memory quotas).
+  Syntax:
+    mutagen test <target>
+  Example:
+    mutagen test examples/fibonacci.py
+
+--------------------------------------------------------------------------------
+
+mutagen evaluate <target>
+  Function:
+    Run a full evaluation cycle:
+      1. Analyze target source code
+      2. Benchmark baseline performance in Docker sandbox
+      3. Retrieve evolutionary memories (past successes & failures)
+      4. Gemma model proposes mutation candidate(s)
+      5. MUTAGEN validates syntax & AST integrity
+      6. Docker sandbox executes candidate tests
+      7. Docker sandbox benchmarks candidate runtime and memory
+      8. Display complete report with code diffs and improvement percentages
+  Syntax:
+    mutagen evaluate <target> [OPTIONS]
+  Options:
+    -o, --objective TEXT     Objective: "speed", "memory", "balanced" (default: balanced)
+    -g, --generations INT    Number of generations to evaluate (default: 1)
+    -p, --population INT     Candidate population per generation (default: 4)
+    -f, --format TEXT        Output format: "text" or "json" (default: text)
+  Example:
+    mutagen evaluate examples/fibonacci.py --objective speed --generations 1 --population 2
+
+--------------------------------------------------------------------------------
+
+mutagen optimize <target>
+  Function:
+    Multi-generation code optimization pipeline. Generates multiple candidate
+    variants, benchmarks each in Docker sandboxes, preserves best performers
+    (elitism), and reports final code diff and speedup metrics.
+  Syntax:
+    mutagen optimize <target> [OPTIONS]
+  Options:
+    -o, --objective TEXT     Objective: "speed", "memory", "balanced" (default: balanced)
+    -g, --generations INT    Number of generations (default: 3)
+    -p, --population INT     Candidates per generation (default: 4)
+    -f, --format TEXT        Output format: "text" or "json" (default: text)
+  Example:
+    mutagen optimize examples/fibonacci.py --objective speed -g 3 -p 4
+
+--------------------------------------------------------------------------------
+
+mutagen evolve <target>
+  Function:
+    Direct entry-point for deep evolutionary optimization engine loops.
+  Syntax:
+    mutagen evolve <target> [OPTIONS]
+  Options:
+    -o, --objective TEXT     "speed", "memory", "balanced"
+    -g, --generations INT    Generation count
+    -p, --population INT     Population size per generation
+  Example:
+    mutagen evolve examples/fibonacci.py -o speed -g 5 -p 4
+
+--------------------------------------------------------------------------------
+
+mutagen history
+  Function:
+    View a table of past evolution experiments run by the current user.
+  Syntax:
+    mutagen history [OPTIONS]
+  Options:
+    --limit, -l INTEGER      Max experiments to list (default: 10)
+  Example:
+    mutagen history --limit 5
+
+--------------------------------------------------------------------------------
+
+mutagen results <experiment_id>
+  Function:
+    View detailed results, generation breakdown, and best survivor for an experiment.
+  Syntax:
+    mutagen results <experiment_id>
+  Example:
+    mutagen results exp-2d93768c
+
+
+================================================================================
+5. APPLYING PATCHES, CERTIFICATES & VERIFICATION
+================================================================================
+
+mutagen apply <candidate_id>
+  Function:
+    Safely apply an optimized mutation candidate directly to the source file on disk.
+    Automatically creates a timestamped backup before writing changes and warns
+    if external edits occurred.
+  Syntax:
+    mutagen apply <candidate_id> [OPTIONS]
+  Options:
+    --backup / --no-backup   Create backup file before overwriting (default: True)
+    --yes, -y                Skip confirmation prompt
+  Example:
+    mutagen apply mut-fib-iter
+
+--------------------------------------------------------------------------------
+
+mutagen export-patch <candidate_id>
+  Function:
+    Export the changes of a candidate mutation as a standard unified patch (.patch) file.
+  Syntax:
+    mutagen export-patch <candidate_id> [OPTIONS]
+  Options:
+    -o, --output PATH        Destination file path for the patch
+  Example:
+    mutagen export-patch mut-fib-iter -o optimizations.patch
+
+--------------------------------------------------------------------------------
+
+mutagen certificate <experiment_id>
+  Function:
+    Generate a cryptographically verifiable JSON optimization certificate detailing
+    the measured baseline vs. optimized speedup, test assertions, and content hashes.
+  Syntax:
+    mutagen certificate <experiment_id> [OPTIONS]
+  Options:
+    -o, --output PATH        Destination file path
+  Example:
+    mutagen certificate exp-2d93768c -o cert.json
+
+--------------------------------------------------------------------------------
+
+mutagen verify <certificate_file>
+  Function:
+    Verify the cryptographic signature and integrity of an optimization certificate.
+  Syntax:
+    mutagen verify cert.json
+
+
+================================================================================
+6. SUBCOMMAND GROUPS
+================================================================================
+
+--- A. CONFIGURATION (mutagen config) ---
+
+mutagen config show
+  Function: Show active MUTAGEN configuration settings (passwords & tokens redacted).
+  Syntax:   mutagen config show [--format text|json]
+
+mutagen config validate
+  Function: Validate environment variables, paths, and model settings.
+  Syntax:   mutagen config validate
+
+
+--- B. PROJECT MANAGEMENT (mutagen project) ---
+
+mutagen project create <name>
+  Function: Create a new project isolated to the authenticated user.
+  Syntax:   mutagen project create <name> [--description TEXT]
+
+mutagen project list
+  Function: List all projects owned by the authenticated user.
+  Syntax:   mutagen project list
+
+mutagen project show <project_id>
+  Function: Display detailed information and experiment history for a project.
+  Syntax:   mutagen project show <project_id>
+
+mutagen project delete <project_id>
+  Function: Delete a project and its associated metadata.
+  Syntax:   mutagen project delete <project_id> [--yes]
+
+
+--- C. EXPERIMENT MANAGEMENT (mutagen experiment) ---
+
+mutagen experiment list
+  Function: List all experiments belonging to the current user.
+  Syntax:   mutagen experiment list [--limit INT]
+
+
+--- D. MUTATION CANDIDATES (mutagen mutation) ---
+
+mutagen mutation list <experiment_id>
+  Function: List all candidate mutations generated during an experiment.
+  Syntax:   mutagen mutation list <experiment_id>
+
+mutagen mutation diff <candidate_id>
+  Function: View colorized code diff for a specific candidate.
+  Syntax:   mutagen mutation diff <candidate_id>
+
+
+--- E. EVOLUTIONARY MEMORY (mutagen memory) ---
+
+mutagen memory list
+  Function: List evolutionary memory records (successful strategies & failure lessons).
+  Syntax:   mutagen memory list [--limit INT]
+
+mutagen memory search <query>
+  Function: Search memory records by keyword, strategy, or target symbol.
+  Syntax:   mutagen memory search <query>
+  Example:  mutagen memory search "fibonacci"
+
+================================================================================
+                            END OF COMMAND REFERENCE
+================================================================================

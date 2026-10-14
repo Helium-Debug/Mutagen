@@ -87,9 +87,8 @@ class GeminiProvider(AIProviderBase):
             candidate_count=candidate_count,
         )
 
-        raw_response = self._call_with_retry(prompt, operation="generate_mutations")
+        raw_response, usage = self._call_with_retry(prompt, operation="generate_mutations")
 
-        usage = {}
         try:
             response = parse_mutation_response(
                 raw_response=raw_response,
@@ -117,12 +116,14 @@ class GeminiProvider(AIProviderBase):
     ) -> str:
         """Generate a human-readable explanation of code changes."""
         prompt = build_explanation_prompt(original, candidate, language)
-        return self._call_with_retry(prompt, operation="explain_change")
+        text, _ = self._call_with_retry(prompt, operation="explain_change")
+        return text
 
     def summarize_experiment(self, experiment_summary: dict) -> str:
         """Generate an experiment summary for evolutionary memory."""
         prompt = build_experiment_summary_prompt(experiment_summary)
-        return self._call_with_retry(prompt, operation="summarize_experiment")
+        text, _ = self._call_with_retry(prompt, operation="summarize_experiment")
+        return text
 
     def check_availability(self) -> tuple[bool, str]:
         """Check if Gemini is configured and reachable."""
@@ -147,7 +148,7 @@ class GeminiProvider(AIProviderBase):
     def model_id(self) -> str:
         return self._model_id
 
-    def _call_with_retry(self, prompt: str, operation: str = "unknown") -> str:
+    def _call_with_retry(self, prompt: str, operation: str = "unknown") -> tuple[str, dict]:
         """
         Call the Gemini API with exponential backoff retry.
 
@@ -156,7 +157,7 @@ class GeminiProvider(AIProviderBase):
             operation: Operation name for logging.
 
         Returns:
-            The raw text response.
+            Tuple of (raw text response, usage data dictionary).
 
         Raises:
             MutagenAIError: After all retries are exhausted.
@@ -166,6 +167,7 @@ class GeminiProvider(AIProviderBase):
         backoff = INITIAL_BACKOFF
 
         for attempt in range(1, MAX_RETRIES + 1):
+            start_time = time.time()
             try:
                 logger.info(
                     f"Gemini {operation} attempt {attempt}/{MAX_RETRIES} "
@@ -181,8 +183,24 @@ class GeminiProvider(AIProviderBase):
                 )
 
                 if response and response.text:
+                    duration_ms = int((time.time() - start_time) * 1000)
                     logger.info(f"Gemini {operation} succeeded on attempt {attempt}")
-                    return response.text
+                    usage_data = {"duration_ms": duration_ms}
+                    if hasattr(response, "usage_metadata") and response.usage_metadata:
+                        meta = response.usage_metadata
+                        p_tok = getattr(meta, "prompt_token_count", None)
+                        c_tok = getattr(meta, "candidates_token_count", None)
+                        t_tok = getattr(meta, "total_token_count", None)
+                        cached_tok = getattr(meta, "cached_content_token_count", 0) or 0
+                        if p_tok is not None:
+                            usage_data["input_tokens"] = p_tok
+                        if c_tok is not None:
+                            usage_data["output_tokens"] = c_tok
+                        if t_tok is not None:
+                            usage_data["total_tokens"] = t_tok
+                        usage_data["cached_input_tokens"] = cached_tok
+
+                    return response.text, usage_data
 
                 raise MutagenAIError(f"Gemini returned empty response for {operation}")
 

@@ -36,6 +36,7 @@ def test_environment(tmp_path, monkeypatch):
     reset_engine()
 
     # Create tables in the test database
+    import mutagen.models  # noqa: F401
     engine = create_engine(db_url)
     Base.metadata.create_all(bind=engine)
 
@@ -78,6 +79,7 @@ def auth_user(test_environment, tmp_path):
 def db_session(tmp_path):
     """Provide a direct SQLAlchemy test session."""
     db_file = tmp_path / "test_mutagen.db"
+    import mutagen.models  # noqa: F401
     engine = create_engine(f"sqlite:///{db_file}")
     Base.metadata.create_all(bind=engine)
     session_factory = sessionmaker(bind=engine, expire_on_commit=False)

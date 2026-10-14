@@ -101,6 +101,79 @@ class DockerSandbox:
                 )
         return self._client
 
+    def reset_client(self):
+        """Reset cached Docker client instance."""
+        self._client = None
+
+    def find_docker_executable(self) -> Optional[Path]:
+        """Locate Docker Desktop executable across known platforms."""
+        import os
+        import platform
+        import shutil
+
+        if platform.system() == "Windows":
+            local_appdata = os.environ.get("LOCALAPPDATA", "")
+            program_files = os.environ.get("ProgramFiles", "C:/Program Files")
+            candidates = [
+                Path(local_appdata) / "Programs" / "DockerDesktop" / "Docker Desktop.exe",
+                Path(program_files) / "Docker" / "Docker" / "Docker Desktop.exe",
+                Path("C:/Program Files/Docker/Docker/Docker Desktop.exe"),
+            ]
+            for candidate in candidates:
+                if candidate.is_file():
+                    return candidate
+
+            # Check PATH for docker.exe and look for sibling Desktop app
+            docker_cmd = shutil.which("docker")
+            if docker_cmd:
+                d_path = Path(docker_cmd).resolve()
+                for parent in (d_path.parent, d_path.parents[1], d_path.parents[2]):
+                    candidate = parent / "Docker Desktop.exe"
+                    if candidate.is_file():
+                        return candidate
+        elif platform.system() == "Darwin":
+            mac_candidate = Path("/Applications/Docker.app")
+            if mac_candidate.exists():
+                return mac_candidate
+        return None
+
+    def launch_docker_daemon(self) -> tuple[bool, str]:
+        """Attempt to launch the Docker engine or Docker Desktop application."""
+        import platform
+        import subprocess
+
+        exe = self.find_docker_executable()
+        if exe:
+            try:
+                if platform.system() == "Windows":
+                    subprocess.Popen([str(exe)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                elif platform.system() == "Darwin":
+                    subprocess.Popen(["open", "-a", "Docker"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return True, f"Launching Docker Desktop from {exe}"
+            except Exception as e:
+                return False, f"Failed to launch Docker Desktop: {e}"
+
+        # On Linux, try systemctl or service
+        if platform.system() == "Linux":
+            try:
+                subprocess.Popen(["systemctl", "start", "docker"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return True, "Attempted systemctl start docker"
+            except Exception as e:
+                return False, f"Could not start docker service: {e}"
+
+        return False, "Docker Desktop executable not found in standard directories"
+
+    def wait_for_daemon(self, timeout: int = 15, poll_interval: float = 1.0) -> bool:
+        """Poll until Docker daemon becomes available or timeout expires."""
+        start = time.time()
+        while time.time() - start < timeout:
+            self.reset_client()
+            ok, _ = self.check_availability()
+            if ok:
+                return True
+            time.sleep(poll_interval)
+        return False
+
     def check_availability(self) -> tuple[bool, str]:
         """Check if Docker is available and the daemon is reachable."""
         try:
@@ -286,43 +359,43 @@ class DockerSandbox:
         escaped_code = code.replace("\\", "\\\\").replace("'", "\\'")
 
         parts = [
-            "import sys, json, time, traceback",
-            "results = {'exit_code': 0, 'output': '', 'errors': ''}",
+            "import sys as __mutagen_sys__, json as __mutagen_json__, time as __mutagen_time__, traceback as __mutagen_traceback__",
+            "__mutagen_results__ = {'exit_code': 0, 'output': '', 'errors': ''}",
             "try:",
             f"    exec(compile('''{escaped_code}''', '<mutagen>', 'exec'))",
-            "    results['output'] = 'Execution successful'",
-            "except Exception as e:",
-            "    results['exit_code'] = 1",
-            "    results['errors'] = traceback.format_exc()",
+            "    __mutagen_results__['output'] = 'Execution successful'",
+            "except Exception as __mutagen_e__:",
+            "    __mutagen_results__['exit_code'] = 1",
+            "    __mutagen_results__['errors'] = __mutagen_traceback__.format_exc()",
         ]
 
         if test_code:
             escaped_test = test_code.replace("\\", "\\\\").replace("'", "\\'")
             parts.extend([
-                "if results['exit_code'] == 0:",
+                "if __mutagen_results__['exit_code'] == 0:",
                 "    try:",
                 f"        exec(compile('''{escaped_test}''', '<test>', 'exec'))",
-                "        results['tests'] = 'Tests passed'",
-                "    except Exception as e:",
-                "        results['exit_code'] = 1",
-                "        results['errors'] += '\\nTest failure: ' + traceback.format_exc()",
+                "        __mutagen_results__['tests'] = 'Tests passed'",
+                "    except Exception as __mutagen_e__:",
+                "        __mutagen_results__['exit_code'] = 1",
+                "        __mutagen_results__['errors'] += '\\nTest failure: ' + __mutagen_traceback__.format_exc()",
             ])
 
         if benchmark_code:
             escaped_bench = benchmark_code.replace("\\", "\\\\").replace("'", "\\'")
             parts.extend([
-                "if results['exit_code'] == 0:",
+                "if __mutagen_results__['exit_code'] == 0:",
                 "    try:",
-                "        start = time.perf_counter()",
+                "        __mutagen_start__ = __mutagen_time__.perf_counter()",
                 f"        exec(compile('''{escaped_bench}''', '<bench>', 'exec'))",
-                "        duration = time.perf_counter() - start",
-                "        results['benchmark_time'] = duration",
-                "    except Exception as e:",
-                "        results['errors'] += '\\nBenchmark error: ' + str(e)",
+                "        __mutagen_duration__ = __mutagen_time__.perf_counter() - __mutagen_start__",
+                "        __mutagen_results__['benchmark_time'] = __mutagen_duration__",
+                "    except Exception as __mutagen_e__:",
+                "        __mutagen_results__['errors'] += '\\nBenchmark error: ' + str(__mutagen_e__)",
             ])
 
-        parts.append("print(json.dumps(results))")
-        parts.append("sys.exit(results['exit_code'])")
+        parts.append("print(__mutagen_json__.dumps(__mutagen_results__))")
+        parts.append("__mutagen_sys__.exit(__mutagen_results__['exit_code'])")
 
         return "\n".join(parts)
 

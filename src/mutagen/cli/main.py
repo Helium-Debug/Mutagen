@@ -11,11 +11,14 @@ from __future__ import annotations
 import difflib
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import typer
+from rich import box
 from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.table import Table
 
 from mutagen import __version__
 from mutagen.cli.display import (
@@ -26,12 +29,14 @@ from mutagen.cli.display import (
 )
 from mutagen.config import get_settings, reset_settings, MutagenSettings
 from mutagen.core.auth import CredentialsManager
-from mutagen.exceptions import MutagenAuthenticationError, MutagenError, MutagenValidationError
+from mutagen.exceptions import (
+    MutagenAuthenticationError, MutagenAuthorizationError, MutagenError, MutagenValidationError,
+)
 from mutagen.schemas import OptimizationObjective, ProgrammingLanguage
 from mutagen.services import (
     AuthService, AnalysisService, ProjectService, ExperimentService,
     ExportService, CertificateService, DiffService, ApplyService,
-    get_ai_provider,
+    UsageService, get_ai_provider,
 )
 
 # ── App Setup ────────────────────────────────────────────────
@@ -240,7 +245,7 @@ def init(
 
     env_file.write_text(content)
     print_success("Created .env configuration file")
-    print_info("Edit .env to set your GROQ_API_KEY, GEMINI_API_KEY, and database settings")
+    print_info("Edit .env to set your GEMMA_BASE_URL, AI model, and database settings")
     print_info("Run 'mutagen doctor' to check your setup")
 
 
@@ -260,10 +265,14 @@ def doctor():
     settings = get_settings()
 
     # AI Provider
-    ai_ok = settings.ai_configured()
+    ai_ok = False
     ai_desc = f"{settings.ai_provider.value} ({settings.ai_model})"
-    if not ai_ok:
-        ai_desc += " [missing API key]"
+    try:
+        provider = get_ai_provider()
+        ai_ok, msg = provider.check_availability()
+        ai_desc = f"{settings.ai_provider.value} ({settings.ai_model}) [{msg}]"
+    except Exception as e:
+        ai_desc += f" [check failed: {e}]"
     checks.append(("AI Provider", ai_desc, ai_ok))
 
     # Database
@@ -275,7 +284,12 @@ def doctor():
     from mutagen.sandbox.docker_manager import DockerSandbox
     sandbox = DockerSandbox()
     docker_ok, docker_msg = sandbox.check_availability()
-    checks.append(("Docker", docker_msg, docker_ok))
+    checks.append(("Docker Daemon", docker_msg, docker_ok))
+    if docker_ok:
+        img_ok, img_msg = sandbox.check_image()
+        checks.append(("Sandbox Image", f"{settings.sandbox_image} ({img_msg})", img_ok))
+    else:
+        checks.append(("Sandbox Image", f"{settings.sandbox_image} (Docker daemon unavailable)", False))
 
     # Artifact directory
     art_ok = settings.artifact_dir.exists()
@@ -300,6 +314,119 @@ def doctor():
         failed = [name for name, _, ok in checks if not ok]
         print_warning(f"Issues found: {', '.join(failed)}")
         print_info("Some features may be unavailable. Fix issues and run 'mutagen doctor' again.")
+
+
+@app.command("docker")
+def docker_command(
+    launch: bool = typer.Option(True, "--launch/--no-launch", help="Attempt to launch Docker if it is currently off"),
+    wait: int = typer.Option(15, "--wait", "-w", help="Seconds to wait for engine to initialize"),
+    up: bool = typer.Option(False, "--up", help="Start background services (PostgreSQL & Redis) via Docker Compose"),
+    down: bool = typer.Option(False, "--down", help="Stop background services via Docker Compose"),
+):
+    """Check Docker engine status, inspect Mutagen containers, and manage background services."""
+    import subprocess
+    from mutagen.sandbox.docker_manager import DockerSandbox
+
+    sandbox = DockerSandbox()
+    is_on, msg = sandbox.check_availability()
+
+    if is_on:
+        console.print()
+        console.print("[bold green]● Docker engine is ON[/bold green]")
+        console.print(f"[green]  Status: {msg}[/green]")
+
+        img_ok, img_msg = sandbox.check_image()
+        if img_ok:
+            console.print(f"[green]  Sandbox Image: {img_msg}[/green]")
+        else:
+            console.print(f"[yellow]  Sandbox Image: {img_msg}[/yellow]")
+
+        # Handle --up
+        if up:
+            console.print("\n[bold cyan]Starting MUTAGEN persistent services via Docker Compose...[/bold cyan]")
+            try:
+                subprocess.run(["docker", "compose", "up", "-d"], check=True)
+                console.print("[bold green]✓ Background services started![/bold green]")
+            except Exception as e:
+                console.print(f"[bold red]Failed to start docker compose: {e}[/bold red]")
+
+        # Handle --down
+        if down:
+            console.print("\n[bold cyan]Stopping MUTAGEN Docker Compose services...[/bold cyan]")
+            try:
+                subprocess.run(["docker", "compose", "down"], check=True)
+                console.print("[bold green]✓ Background services stopped.[/bold green]")
+            except Exception as e:
+                console.print(f"[bold red]Failed to stop docker compose: {e}[/bold red]")
+
+        # List active containers under Mutagen
+        active_containers = []
+        try:
+            client = sandbox._get_client()
+            active_containers = client.containers.list(all=True)
+        except Exception:
+            pass
+
+        mutagen_containers = [
+            c for c in active_containers
+            if any("mutagen" in str(name).lower() for name in [c.name] + (c.attrs.get("Names") or []))
+        ]
+
+        if mutagen_containers:
+            console.print("\n[bold cyan]Containers under 'mutagen' in Docker Desktop:[/bold cyan]")
+            for c in mutagen_containers:
+                status_color = "green" if c.status == "running" else "yellow"
+                image_name = c.image.tags[0] if c.image.tags else c.short_id
+                console.print(f"  • [bold]{c.name}[/bold] ({image_name}) -> [{status_color}]{c.status}[/{status_color}]")
+        else:
+            console.print("\n[dim]Persistent containers: None currently active.[/dim]")
+            console.print("[dim]  To start background Postgres/Redis in Docker Desktop: [bold bright_cyan]mutagen docker --up[/bold bright_cyan][/dim]")
+
+        console.print("\n[dim][italic]Note: Candidate sandbox containers are ephemeral by design.[/italic][/dim]")
+        console.print("[dim]During evaluation ('mutagen test' / 'mutagen evaluate'), sandbox containers are spun up[/dim]")
+        console.print("[dim]for isolated execution and automatically removed immediately after tests complete.[/dim]")
+        console.print("[bold green]✓ Docker sandbox is ready for candidate execution and benchmarking.[/bold green]\n")
+        return
+
+    # Docker engine is OFF
+    console.print()
+    console.print("[bold red]● Docker engine is OFF[/bold red]")
+    console.print(f"[red]  Status: {msg}[/red]")
+
+    if not launch:
+        console.print("[red]Docker daemon is not running. Please start Docker Desktop to enable candidate sandboxing.[/red]\n")
+        raise typer.Exit(code=1)
+
+    # Attempt to start Docker and notify
+    console.print("[bold yellow]› Attempting to start Docker...[/bold yellow]")
+    started, launch_msg = sandbox.launch_docker_daemon()
+    if started:
+        console.print(f"[cyan]  {launch_msg}[/cyan]")
+        console.print(f"[dim]  Waiting up to {wait}s for Docker engine to become ready...[/dim]")
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            transient=True,
+        ) as progress:
+            progress.add_task("Waiting for Docker engine to initialize...", total=None)
+            is_ready = sandbox.wait_for_daemon(timeout=wait, poll_interval=1.5)
+
+        if is_ready:
+            console.print("[bold green]● Docker engine is now ON[/bold green]")
+            console.print("[bold green]✓ Docker engine started successfully and daemon is reachable![/bold green]\n")
+            return
+        else:
+            console.print("[bold red]● Docker engine is OFF[/bold red]")
+            console.print(
+                "[red]Docker was launched but the daemon is still initializing in the background.[/red]\n"
+                "[red]Please wait a moment for Docker Desktop to finish booting, then run 'mutagen docker' again.[/red]\n"
+            )
+            raise typer.Exit(code=1)
+    else:
+        console.print(f"[bold red]✗ Could not automatically start Docker: {launch_msg}[/bold red]")
+        console.print("[red]Please start Docker Desktop manually.[/red]\n")
+        raise typer.Exit(code=1)
 
 
 # ── Config Commands ──────────────────────────────────────────
@@ -364,6 +491,7 @@ def config_validate():
 def analyze(
     file_path: str = typer.Argument(..., help="Path to source file to analyze"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed analysis"),
+    ai: bool = typer.Option(False, "--ai", help="Include AI model structural, bottleneck, and optimization analysis"),
     format: str = typer.Option("text", "--format", "-f", help="Output format: text or json"),
 ):
     """Analyze a source code file. Authentication required."""
@@ -371,13 +499,22 @@ def analyze(
 
     try:
         service = AnalysisService()
-        analysis = service.analyze_file(file_path)
+        if ai:
+            combined = service.analyze_with_ai(file_path)
+            analysis = service.analyze_file(file_path)
+            ai_data = combined.get("ai_analysis", {})
+        else:
+            analysis = service.analyze_file(file_path)
+            ai_data = None
     except MutagenError as e:
         print_error(str(e))
         raise typer.Exit(code=e.exit_code)
 
     if format == "json":
-        print_json_output(analysis.model_dump())
+        output = analysis.model_dump()
+        if ai_data:
+            output["ai_analysis"] = ai_data
+        print_json_output(output)
         return
 
     print_banner()
@@ -436,6 +573,29 @@ def analyze(
         err_console.print(f"\n[bold]Public Interface:[/]")
         err_console.print(f"  {', '.join(analysis.public_interface)}")
 
+    # Display AI Analysis if requested
+    if ai_data:
+        err_console.print()
+        err_console.print("[bold bright_magenta]AI Model Code Analysis (Gemma)[/]")
+        complexity_info = ai_data.get("complexity", {})
+        if "estimated_time_complexity" in complexity_info:
+            print_key_value("AI Time Complexity", str(complexity_info.get("estimated_time_complexity")))
+        if "estimated_space_complexity" in complexity_info:
+            print_key_value("AI Space Complexity", str(complexity_info.get("estimated_space_complexity")))
+        bottlenecks = complexity_info.get("bottlenecks", [])
+        if bottlenecks:
+            err_console.print("\n[bold yellow]Identified Bottlenecks:[/]")
+            for b in bottlenecks:
+                err_console.print(f"  • {b}")
+        suggestions = ai_data.get("optimization_suggestions", [])
+        if suggestions:
+            err_console.print("\n[bold green]AI Optimization Proposals:[/]")
+            for s in suggestions:
+                desc = s.get("description", "")
+                target = s.get("target_symbol", "module")
+                strategy = s.get("strategy", "general")
+                err_console.print(f"  • [{strategy}] {target}: {desc}")
+
     print_success("Analysis complete")
 
 
@@ -469,6 +629,69 @@ def test_command(
             err_console.print()
             for summary in result.failure_summaries:
                 err_console.print(f"[bold red]Failure Details:[/]\n{summary.strip()}")
+
+        if path.is_file():
+            err_console.print()
+            print_info(f"Initiating automated code repair on {path.name} using local Gemma 2...")
+            from mutagen.ai.repair import CodeRepairService
+            repair_svc = CodeRepairService()
+            rep_res = repair_svc.repair_file(path, failures=result.failure_summaries or ["Tests failed"])
+            if rep_res.success and rep_res.changes_made:
+                print_success(f"File {path.name} was successfully updated with corrected code via {rep_res.model_used}!")
+                re_content = path.read_text(encoding="utf-8")
+                re_result = runner.run_tests("repaired", re_content)
+                if re_result.all_passed:
+                    print_success(f"Re-test verified: All tests now PASS! (duration: {re_result.duration_seconds:.3f}s)")
+                else:
+                    print_warning("Re-test: Some tests still need manual review.")
+            elif not rep_res.success:
+                print_error(f"Repair attempt failed: {rep_res.error_message}")
+
+
+@app.command("repair")
+def repair_cmd(
+    target: str = typer.Argument(..., help="Path to source file to test and repair if failing"),
+    test_command: Optional[str] = typer.Option(None, "--test-cmd", help="Optional test command"),
+):
+    """Run tests on a file and automatically repair the code using local gemma2 if any test fails."""
+    user = require_auth()
+    path = Path(target).resolve()
+    if not path.exists() or not path.is_file():
+        print_error(f"File not found: {path}")
+        raise typer.Exit(code=2)
+
+    print_banner()
+    err_console.print(f"[bold]Checking and repairing target: {path.name} (User: {user['username']})[/]\n")
+
+    content = path.read_text(encoding="utf-8")
+    from mutagen.sandbox.docker_manager import DockerSandbox
+    from mutagen.testing.test_runner import TestRunner
+
+    sandbox = DockerSandbox()
+    runner = TestRunner(sandbox)
+    result = runner.run_tests("baseline", content, test_command=test_command)
+
+    if result.all_passed:
+        print_success(f"All tests already PASS for {path.name}!")
+        return
+
+    print_warning(f"Tests FAILED ({result.failed} failed, {result.errors} errors). Updating code using local gemma2...")
+    from mutagen.ai.repair import CodeRepairService
+    repair_svc = CodeRepairService()
+    rep_res = repair_svc.repair_file(path, failures=result.failure_summaries or ["Tests failed"])
+
+    if rep_res.success and rep_res.changes_made:
+        print_success(f"Updated {path.name} with corrected code using {rep_res.model_used}.")
+        re_result = runner.run_tests("repaired", path.read_text(encoding="utf-8"), test_command=test_command)
+        if re_result.all_passed:
+            print_success(f"Re-test confirmed: All tests now PASS!")
+        else:
+            print_warning("Re-test: Some checks still require attention.")
+    elif not rep_res.changes_made:
+        print_info("No changes were made by the repair model.")
+    else:
+        print_error(f"Repair failed: {rep_res.error_message}")
+        raise typer.Exit(code=1)
 
 
 @app.command("evaluate")
@@ -612,6 +835,7 @@ def evolve(
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be done without executing"),
     format: str = typer.Option("text", "--format", "-f", help="Output format: text or json"),
     test_command: Optional[str] = typer.Option(None, "--test-cmd", help="Test command to run"),
+    stop_on_stagnation: bool = typer.Option(False, "--stop-on-stagnation", help="Stop evolution early if stagnation is reached"),
 ):
     """Evolve a source file through AI-powered mutation and selection. Authentication required."""
     user = require_auth()
@@ -646,6 +870,7 @@ def evolve(
         memory_limit_mb=settings.memory_limit,
         test_command=test_command,
         dry_run=dry_run,
+        stop_on_stagnation=stop_on_stagnation,
     )
 
     if dry_run:
@@ -688,8 +913,72 @@ def evolve(
         imp = format_improvement(summary.best_improvement_percent)
         print_key_value("Best improvement", imp)
 
+    # Show candidates table and results
+    exp_svc = ExperimentService()
+    results = exp_svc.get_experiment_results(summary.experiment_id, user_id=user["id"])
+    if results:
+        candidates = results.get("candidates", [])
+        if candidates:
+            err_console.print()
+            table = Table(
+                title=f"Evaluated Candidates for {summary.experiment_id}",
+                box=box.ROUNDED,
+                border_style="bright_cyan",
+                header_style="bold bright_white",
+            )
+            table.add_column("Candidate ID", style="cyan")
+            table.add_column("Gen", justify="center")
+            table.add_column("Strategy")
+            table.add_column("Verdict", justify="center")
+            table.add_column("Status", justify="center")
+            table.add_column("Speed Imp.", justify="right")
+            table.add_column("Eligible", justify="center")
+
+            for c in candidates:
+                verdict = c.get("verification_verdict") or "-"
+                v_style = (
+                    "bold green" if verdict == "ACCEPT"
+                    else ("bold yellow" if verdict == "REVIEW"
+                    else ("bold red" if verdict == "REJECT" else "white"))
+                )
+                v_str = f"[{v_style}]{verdict}[/{v_style}]" if verdict != "-" else "-"
+
+                speed = c.get("speed_improvement")
+                speed_str = format_improvement(speed) if speed is not None else "-"
+                speed_style = "bold green" if (speed or 0) > 0 else ("bold red" if (speed or 0) < 0 else "white")
+                speed_disp = f"[{speed_style}]{speed_str}[/{speed_style}]" if speed is not None else "-"
+
+                is_el = c.get("is_eligible", False)
+                el_disp = "[bold green]YES[/]" if is_el else "[dim]NO[/]"
+
+                c_status = c.get("status", "")
+                stat_style = "bold green" if c_status == "best_eligible" else "white"
+
+                table.add_row(
+                    c["id"][:12],
+                    str(c.get("generation", 1)),
+                    c.get("strategy", "unknown"),
+                    v_str,
+                    f"[{stat_style}]{c_status}[/]",
+                    speed_disp,
+                    el_disp,
+                )
+            err_console.print(table)
+
+        best_cand_id = summary.best_candidate_id
+        if best_cand_id:
+            try:
+                diff_report = exp_svc.get_candidate_diff(best_cand_id, user_id=user["id"])
+                if diff_report:
+                    err_console.print()
+                    print_evolution_report(diff_report)
+            except Exception:
+                pass
+
     if summary.status.value == "succeeded":
         print_success("Evolution succeeded! Use 'mutagen apply' to inspect and apply optimized code.")
+    else:
+        print_info(f"Evolution complete with status: {summary.status.value.upper()}")
 
 
 # ── Top-level Diff, Show, History, Apply, Export-Patch ───────
@@ -825,6 +1114,66 @@ def results_cmd(
         print_key_value("Best candidate", exp["best_candidate_id"])
     if exp.get("best_improvement_percent") is not None:
         print_key_value("Improvement", format_improvement(exp["best_improvement_percent"]))
+
+    candidates = results.get("candidates", [])
+    if candidates:
+        console.print("\n[bold bright_cyan]Candidate Verification & Evaluation Summary[/]")
+        table = create_results_table(f"Candidates ({len(candidates)})")
+        table.add_column("Candidate ID", style="bold bright_white")
+        table.add_column("Strategy", style="dim")
+        table.add_column("Verdict", style="bold")
+        table.add_column("Fitness", justify="right")
+        table.add_column("Speed", justify="right")
+        table.add_column("Eligible")
+
+        for c in candidates:
+            verdict = c.get("verification_verdict") or ("ACCEPT" if c.get("verification_passed") else "-")
+            v_style = "green" if verdict == "ACCEPT" else ("yellow" if verdict == "REVIEW" else ("red" if verdict == "REJECT" else "white"))
+            fit = f"{c.get('fitness_score'):.3f}" if c.get("fitness_score") is not None else "-"
+            spd = format_improvement(c.get("speed_improvement")) if c.get("speed_improvement") is not None else "-"
+            elig = "✓" if c.get("is_eligible") else "✗"
+            table.add_row(
+                c["id"][:12],
+                c.get("strategy", "-"),
+                f"[{v_style}]{verdict}[/{v_style}]",
+                fit,
+                spd,
+                f"[{'green' if c.get('is_eligible') else 'red'}]{elig}[/]",
+            )
+        console.print(table)
+
+    best_cand = results.get("best_candidate")
+    if best_cand and best_cand.get("verification_json"):
+        from mutagen.verification.report import format_verification_report
+        try:
+            console.print("\n" + format_verification_report(best_cand["verification_json"]))
+        except Exception:
+            pass
+
+
+@app.command("verify-candidate")
+def verify_candidate_cmd(
+    candidate_id: str = typer.Argument(..., help="Candidate ID"),
+    format: str = typer.Option("text", "--format", "-f", help="Output format: text or json"),
+):
+    """View full correctness verification report for a candidate. Authentication required."""
+    user = require_auth()
+    exp_svc = ExperimentService()
+    cand = exp_svc.get_candidate(candidate_id, user_id=user["id"])
+    if not cand:
+        print_error(f"Candidate '{candidate_id}' not found.")
+        raise typer.Exit(code=2)
+
+    verif = cand.get("verification_json")
+    if not verif:
+        print_warning(f"No verification report available for candidate '{candidate_id}'.")
+        return
+
+    if format == "json":
+        print_json_output(verif)
+    else:
+        from mutagen.verification.report import format_verification_report
+        console.print(format_verification_report(verif))
 
 
 @app.command("apply")
@@ -1227,6 +1576,462 @@ def memory_search(
         console.print(f"  [bold magenta]›[/] [{r.memory_type.value.upper()}] {r.content[:160]}...")
 
 
+
+# ── Usage & Token Tracking Commands ──────────────────────────
+
+def _render_usage_dashboard(data: dict) -> None:
+    """Format and print the standard MUTAGEN usage dashboard."""
+    if data.get("is_empty"):
+        lines = [
+            "-" * 50,
+            "MUTAGEN TOKEN USAGE",
+            "-" * 50,
+            "",
+            "No token usage or cache events recorded yet.",
+            "",
+            "Run an analysis or evolutionary optimization to generate usage records:",
+            "    mutagen analyze <file>",
+            "    mutagen optimize <file>",
+            "",
+            "-" * 50,
+        ]
+        console.print("\n" + "\n".join(lines) + "\n")
+        return
+
+    stats = data["analysis_statistics"]
+    tokens = data["token_consumption"]
+    opt = data["optimization"]
+    hit_rate = f"{opt['cache_hit_rate']:.1f}%"
+
+    lines = [
+        "-" * 50,
+        "MUTAGEN TOKEN USAGE",
+        "-" * 50,
+        "",
+        "ANALYSIS STATISTICS",
+        "",
+        f"Total Analyses:                  {stats['total_analyses']:>12,}",
+        f"Actual AI Requests:              {stats['actual_ai_requests']:>12,}",
+        f"Successful Requests:             {stats['successful_requests']:>12,}",
+        f"Failed Requests:                 {stats['failed_requests']:>12,}",
+        f"Cache Hits:                      {stats['cache_hits']:>12,}",
+        f"Cache Misses:                    {stats['cache_misses']:>12,}",
+        f"Incremental Analyses:            {stats['incremental_analyses']:>12,}",
+        "",
+        "TOKEN CONSUMPTION",
+        "",
+        f"Actual Input Tokens:         {tokens['actual_input_tokens']:>15,}",
+        f"Actual Output Tokens:        {tokens['actual_output_tokens']:>15,}",
+        f"Actual Total Tokens:         {tokens['actual_total_tokens']:>15,}",
+    ]
+
+    if tokens.get("cached_input_tokens", 0) > 0:
+        lines.append(f"Cached Input Tokens:         {tokens['cached_input_tokens']:>15,}")
+    if tokens.get("estimated_total_tokens", 0) > 0:
+        lines.append(f"Estimated Tokens (approx):   {tokens['estimated_total_tokens']:>15,}")
+    if tokens.get("unavailable_measurements", 0) > 0:
+        lines.append(f"Unavailable Measurements:    {tokens['unavailable_measurements']:>15,}")
+
+    lines.extend([
+        "",
+        "OPTIMIZATION",
+        "",
+        f"AI Requests Avoided:             {opt['ai_requests_avoided']:>12,}",
+        f"Estimated Tokens Saved:          {opt['estimated_tokens_saved']:>12,}",
+        f"Cache Hit Rate:                  {hit_rate:>12}",
+    ])
+
+    if "total_work_tokens" in opt:
+        lines.append(f"Work Equivalent:             {opt['total_work_tokens']:>15,}")
+    if "efficiency_multiplier" in opt:
+        lines.append(f"Efficiency Multiplier:       {opt['efficiency_multiplier']:>15}")
+
+    lines.extend([
+        "",
+        "-" * 50,
+    ])
+    console.print("\n" + "\n".join(lines) + "\n")
+
+    # 1. Log of WHERE and HOW tokens are saved (Storage Architecture)
+    storage_info = data.get("storage_and_mechanisms", [])
+    if storage_info:
+        console.print("[bold bright_cyan]WHERE & HOW TOKENS ARE SAVED (Storage Architecture)[/bold bright_cyan]")
+        console.print("[dim]-------------------------------------------------------------[/dim]")
+        for i, item in enumerate(storage_info, 1):
+            console.print(f"[bold bright_white]{i}. {item['layer']}[/bold bright_white]")
+            console.print(f"   [dim]Where Saved:[/]   [bright_yellow]{item['storage_location']}[/bright_yellow]")
+            console.print(f"   [dim]Mechanism:[/]     [white]{item['mechanism']}[/white]")
+            console.print(f"   [dim]How Saved:[/]     [dim]{item['how_saved']}[/dim]")
+        console.print()
+
+    # 2. Token Savings Breakdown by Storage Layer
+    breakdown = data.get("savings_breakdown", [])
+    if breakdown:
+        b_table = Table(
+            title="Token Savings Breakdown by Storage Layer",
+            box=box.ROUNDED,
+            border_style="bright_cyan",
+            header_style="bold bright_white",
+            title_style="bold bright_cyan",
+        )
+        b_table.add_column("Storage Layer / Cache Type", style="cyan")
+        b_table.add_column("Hits", justify="right", style="green")
+        b_table.add_column("Misses", justify="right", style="dim")
+        b_table.add_column("Requests Avoided", justify="right", style="bright_yellow")
+        b_table.add_column("Estimated Tokens Saved", justify="right", style="bold green")
+
+        for b in breakdown:
+            b_table.add_row(
+                b["cache_type"],
+                f"{b['hits']:,}",
+                f"{b['misses']:,}",
+                f"{b['requests_avoided']:,}",
+                f"+{b['tokens_avoided']:,}",
+            )
+        console.print(b_table)
+        console.print()
+
+    # 3. Recent Token Savings Audit Log
+    recent_log = data.get("recent_savings_log", [])
+    if recent_log:
+        log_table = Table(
+            title="Recent Token Savings Audit Log",
+            box=box.ROUNDED,
+            border_style="bright_cyan",
+            header_style="bold bright_white",
+            title_style="bold bright_cyan",
+        )
+        log_table.add_column("Timestamp", style="dim")
+        log_table.add_column("Operation", style="cyan")
+        log_table.add_column("Storage Layer", style="bright_yellow")
+        log_table.add_column("Baseline / How Saved")
+        log_table.add_column("Tokens Avoided", justify="right", style="bold green")
+
+        for ev in recent_log:
+            log_table.add_row(
+                ev["timestamp"],
+                ev["operation"],
+                ev["cache_type"],
+                ev.get("baseline", "Historical measured baseline"),
+                f"+{ev['tokens_avoided']:,}",
+            )
+        console.print(log_table)
+        console.print()
+
+
+def _render_detailed_records(data: dict, page: int) -> None:
+    """Format and display detailed usage records in a rich table."""
+    records = data.get("records", [])
+    pagination = data.get("pagination", {"page": page, "total_pages": 1, "total_records": 0})
+
+    if not records:
+        console.print("\n[dim]No detailed usage records found matching the criteria.[/dim]\n")
+        return
+
+    table = Table(
+        title=f"MUTAGEN AI Usage Records — Page {pagination['page']} of {pagination['total_pages']} (Total: {pagination['total_records']})",
+        box=box.ROUNDED,
+        border_style="bright_cyan",
+        header_style="bold bright_white",
+        title_style="bold bright_cyan",
+    )
+    table.add_column("Timestamp", style="dim")
+    table.add_column("Operation", style="bold bright_cyan")
+    table.add_column("Provider/Model")
+    table.add_column("Input", justify="right")
+    table.add_column("Output", justify="right")
+    table.add_column("Total", justify="right", style="bold")
+    table.add_column("Source")
+    table.add_column("Status")
+    table.add_column("Latency", justify="right")
+
+    for r in records:
+        prov_model = f"{r.get('provider', '')}/{r.get('model', '')}" if r.get("provider") else "-"
+        in_tok = f"{r['raw_input_tokens']:,}" if r.get("raw_input_tokens") is not None else str(r.get("input_tokens", "-"))
+        out_tok = f"{r['raw_output_tokens']:,}" if r.get("raw_output_tokens") is not None else str(r.get("output_tokens", "-"))
+        tot_tok = f"{r['raw_total_tokens']:,}" if r.get("raw_total_tokens") is not None else str(r.get("total_tokens", "-"))
+        lat = f"{r['latency_ms']:.0f}ms" if r.get("latency_ms") is not None else "-"
+        status_val = str(r.get("status", "-"))
+        status_style = "green" if status_val == "success" else "red"
+
+        table.add_row(
+            r.get("timestamp", "-"),
+            r.get("operation", "-"),
+            prov_model,
+            in_tok,
+            out_tok,
+            tot_tok,
+            r.get("measurement_source", "-"),
+            f"[{status_style}]{status_val}[/{status_style}]",
+            lat,
+        )
+
+    console.print()
+    console.print(table)
+    if pagination["total_pages"] > 1:
+        console.print(f"[dim]Showing page {pagination['page']} of {pagination['total_pages']}. Use --page <N> to view other pages.[/dim]\n")
+
+
+def _render_cache_stats(data: dict) -> None:
+    """Format and display cache event statistics."""
+    summary = data.get("summary", {})
+    breakdown = data.get("breakdown_by_type", {})
+
+    console.print("\n[bold bright_cyan]MUTAGEN Cache & Optimization Statistics[/bold bright_cyan]\n")
+    print_key_value("Total Lookups", f"{summary.get('total_lookups', 0):,}")
+    print_key_value("Cache Hits", f"{summary.get('cache_hits', 0):,}")
+    print_key_value("Cache Misses", f"{summary.get('cache_misses', 0):,}")
+    print_key_value("Incremental Analyses", f"{summary.get('incremental_analyses', 0):,}")
+    print_key_value("Cache Hit Rate", f"{summary.get('cache_hit_rate', 0.0):.1f}%")
+    print_key_value("AI Requests Avoided", f"{summary.get('ai_requests_avoided', 0):,}")
+    print_key_value("Estimated Tokens Saved", f"{summary.get('estimated_tokens_saved', 0):,}")
+
+    if breakdown:
+        console.print("\n[bold]Breakdown by Cache Layer:[/bold]\n")
+        table = Table(box=box.SIMPLE_HEAVY, border_style="bright_cyan")
+        table.add_column("Cache Layer", style="bold")
+        table.add_column("Hits", justify="right", style="green")
+        table.add_column("Misses", justify="right", style="yellow")
+        table.add_column("Est. Tokens Avoided", justify="right", style="cyan")
+        for ctype, cdata in breakdown.items():
+            table.add_row(
+                ctype,
+                f"{cdata.get('hits', 0):,}",
+                f"{cdata.get('misses', 0):,}",
+                f"{cdata.get('tokens_avoided', 0):,}",
+            )
+        console.print(table)
+    console.print()
+
+
+def _render_savings_report(data: dict) -> None:
+    """Format and display token savings report."""
+    console.print("\n[bold bright_cyan]MUTAGEN Token Savings & Avoided Work[/bold bright_cyan]\n")
+    print_key_value("AI Requests Avoided", f"{data.get('total_requests_avoided', 0):,}")
+    print_key_value("Estimated Tokens Saved", f"{data.get('total_estimated_tokens_saved', 0):,}")
+    print_key_value("Cache Hit Rate", f"{data.get('cache_hit_rate', 0.0):.1f}%")
+
+    notice = data.get("accounting_notice")
+    if notice:
+        console.print(f"\n[dim italic]Notice: {notice}[/dim italic]\n")
+
+    events = data.get("recent_savings_events", [])
+    if events:
+        console.print("[bold]Recent Avoided Work & Savings Events:[/bold]\n")
+        table = Table(box=box.ROUNDED, border_style="bright_cyan")
+        table.add_column("Timestamp", style="dim")
+        table.add_column("Operation", style="bold bright_cyan")
+        table.add_column("Cache Layer")
+        table.add_column("Requests Avoided", justify="right")
+        table.add_column("Tokens Avoided", justify="right", style="bold green")
+        table.add_column("Baseline Method")
+        for ev in events:
+            table.add_row(
+                ev.get("timestamp", "-"),
+                ev.get("operation", "-"),
+                ev.get("cache_type", "-"),
+                str(ev.get("requests_avoided", 1)),
+                f"{ev.get('tokens_avoided', 0):,}",
+                ev.get("baseline", "Historical baseline"),
+            )
+        console.print(table)
+    console.print()
+
+
+@app.command("usage")
+def usage(
+    detailed: bool = typer.Option(False, "--detailed", "-d", help="Display individual usage records with pagination"),
+    today: bool = typer.Option(False, "--today", help="Filter usage for today only"),
+    since: Optional[str] = typer.Option(None, "--since", help="Filter records since date (YYYY-MM-DD)"),
+    until: Optional[str] = typer.Option(None, "--until", help="Filter records until date (YYYY-MM-DD)"),
+    operation: Optional[str] = typer.Option(None, "--operation", "-o", help="Filter by operation (analyze, mutate, evolution, explain-failure)"),
+    cache: bool = typer.Option(False, "--cache", help="Display cache hit and event statistics"),
+    savings: bool = typer.Option(False, "--savings", help="Display estimated token savings and avoided work"),
+    export: Optional[str] = typer.Option(None, "--export", "-e", help="Export report format: 'csv' or 'json'"),
+    json_output: bool = typer.Option(False, "--json", help="Output raw machine-readable JSON without styling"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Filter by project ID"),
+    provider: Optional[str] = typer.Option(None, "--provider", help="Filter by AI provider"),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Filter by AI model"),
+    page: int = typer.Option(1, "--page", min=1, help="Page number for detailed records"),
+    limit: int = typer.Option(20, "--limit", min=1, max=100, help="Records per page for detailed view"),
+):
+    """
+    Inspect AI token consumption, cache performance, and optimization savings.
+
+    Displays dashboard by default. Supports filtering, detailed pagination, and export.
+    """
+    # 1. Date range validation
+    since_dt: Optional[datetime] = None
+    until_dt: Optional[datetime] = None
+
+    if today:
+        now = datetime.now()
+        since_dt = datetime(now.year, now.month, now.day, 0, 0, 0)
+        until_dt = datetime(now.year, now.month, now.day, 23, 59, 59)
+    else:
+        if since:
+            try:
+                d = datetime.strptime(since.strip(), "%Y-%m-%d")
+                since_dt = datetime(d.year, d.month, d.day, 0, 0, 0)
+            except ValueError:
+                print_error(f"Invalid date format for --since: '{since}'. Expected YYYY-MM-DD.")
+                raise typer.Exit(code=2)
+        if until:
+            try:
+                d = datetime.strptime(until.strip(), "%Y-%m-%d")
+                until_dt = datetime(d.year, d.month, d.day, 23, 59, 59)
+            except ValueError:
+                print_error(f"Invalid date format for --until: '{until}'. Expected YYYY-MM-DD.")
+                raise typer.Exit(code=2)
+
+    if since_dt and until_dt and since_dt > until_dt:
+        print_error(f"Invalid date range: --since ({since}) must be earlier than or equal to --until ({until}).")
+        raise typer.Exit(code=2)
+
+    # 2. Export format validation
+    export_fmt = None
+    if export:
+        export_fmt = export.strip().lower()
+        if export_fmt not in ("csv", "json"):
+            print_error(f"Invalid export format: '{export}'. Supported formats are: csv, json.")
+            raise typer.Exit(code=2)
+
+    # 3. Authentication & Authorization
+    user = require_auth()
+    user_id = user["id"]
+
+    usage_svc = UsageService()
+
+    try:
+        # 4. Handle export requests
+        if export_fmt == "csv":
+            csv_content = usage_svc.export_csv(
+                user_id=user_id,
+                project_id=project,
+                since=since_dt,
+                until=until_dt,
+                operation=operation,
+                provider=provider,
+                model=model,
+            )
+            sys.stdout.write(csv_content)
+            return
+
+        if export_fmt == "json":
+            json_data = usage_svc.export_json(
+                user_id=user_id,
+                project_id=project,
+                since=since_dt,
+                until=until_dt,
+                operation=operation,
+                provider=provider,
+                model=model,
+            )
+            print_json_output(json_data)
+            return
+
+        # 5. Handle machine-readable JSON output
+        if json_output:
+            if detailed:
+                data = usage_svc.get_detailed_records(
+                    user_id=user_id,
+                    project_id=project,
+                    since=since_dt,
+                    until=until_dt,
+                    operation=operation,
+                    provider=provider,
+                    model=model,
+                    page=page,
+                    limit=limit,
+                )
+            elif cache:
+                data = usage_svc.get_cache_statistics(
+                    user_id=user_id,
+                    project_id=project,
+                    since=since_dt,
+                    until=until_dt,
+                    operation=operation,
+                )
+            elif savings:
+                data = usage_svc.get_savings_report(
+                    user_id=user_id,
+                    project_id=project,
+                    since=since_dt,
+                    until=until_dt,
+                    operation=operation,
+                )
+            else:
+                data = usage_svc.get_usage_dashboard(
+                    user_id=user_id,
+                    project_id=project,
+                    since=since_dt,
+                    until=until_dt,
+                    operation=operation,
+                    provider=provider,
+                    model=model,
+                )
+            print_json_output(data)
+            return
+
+        # 6. Display human-readable outputs
+        if detailed:
+            data = usage_svc.get_detailed_records(
+                user_id=user_id,
+                project_id=project,
+                since=since_dt,
+                until=until_dt,
+                operation=operation,
+                provider=provider,
+                model=model,
+                page=page,
+                limit=limit,
+            )
+            _render_detailed_records(data, page)
+        elif cache:
+            data = usage_svc.get_cache_statistics(
+                user_id=user_id,
+                project_id=project,
+                since=since_dt,
+                until=until_dt,
+                operation=operation,
+            )
+            _render_cache_stats(data)
+        elif savings:
+            data = usage_svc.get_savings_report(
+                user_id=user_id,
+                project_id=project,
+                since=since_dt,
+                until=until_dt,
+                operation=operation,
+            )
+            _render_savings_report(data)
+        else:
+            data = usage_svc.get_usage_dashboard(
+                user_id=user_id,
+                project_id=project,
+                since=since_dt,
+                until=until_dt,
+                operation=operation,
+                provider=provider,
+                model=model,
+            )
+            _render_usage_dashboard(data)
+
+    except (MutagenAuthenticationError, MutagenAuthorizationError) as e:
+        print_error(str(e))
+        raise typer.Exit(code=1)
+    except MutagenValidationError as e:
+        print_error(str(e))
+        raise typer.Exit(code=2)
+    except Exception as e:
+        err_msg = str(e)
+        if "connect" in err_msg.lower() or "database" in err_msg.lower() or "operationalerror" in err_msg.lower():
+            print_error(f"Database error: Unable to connect to MUTAGEN database.\nDetails: {err_msg}")
+        else:
+            print_error(f"Failed to query usage records: {err_msg}")
+        raise typer.Exit(code=1)
+
+
 # ── Helpers ──────────────────────────────────────────────────
 
 def _redact_url(url: str) -> str:
@@ -1238,10 +2043,10 @@ def _redact_url(url: str) -> str:
 def _default_env_content() -> str:
     """Default .env template content."""
     return """# MUTAGEN Configuration
-MUTAGEN_AI_PROVIDER=groq
-MUTAGEN_AI_MODEL=llama-3.3-70b-versatile
-GROQ_API_KEY=your-api-key-here
-GEMINI_API_KEY=
+MUTAGEN_AI_PROVIDER=gemma
+MUTAGEN_AI_MODEL=gemma4:e4b
+GEMMA_BASE_URL=http://localhost:11434
+# GEMMA_API_KEY=
 MUTAGEN_DATABASE_URL=postgresql+psycopg://mutagen:mutagen@localhost:5432/mutagen
 MUTAGEN_REDIS_URL=redis://localhost:6379/0
 MUTAGEN_LOG_LEVEL=INFO

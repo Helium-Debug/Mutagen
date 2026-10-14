@@ -95,6 +95,110 @@ class AIProviderBase(ABC):
         """
         ...
 
+    def analyze_code(
+        self,
+        source_code: str,
+        language: str,
+        objective: OptimizationObjective = OptimizationObjective.BALANCED,
+        static_context: Optional[dict] = None,
+    ) -> dict:
+        """
+        Analyze code structure, complexity, bottlenecks, and correctness invariants.
+
+        Args:
+            source_code: Target code content.
+            language: Programming language.
+            objective: Target optimization objective.
+            static_context: Optional AST or static analysis dictionary.
+
+        Returns:
+            Structured analysis result dictionary.
+        """
+        return {
+            "language": language,
+            "structural_summary": {"public_interface": []},
+            "complexity": {"estimated_time_complexity": "unknown"},
+            "optimization_suggestions": [],
+            "correctness_invariants": [],
+        }
+
+    def explain_failure(
+        self,
+        original: str,
+        candidate: str,
+        failure_reasons: list[str],
+        language: str,
+    ) -> str:
+        """
+        Explain a failed mutation or regression.
+
+        Args:
+            original: Original source code.
+            candidate: Candidate code that failed.
+            failure_reasons: List of test or validation error messages.
+            language: Target programming language.
+
+        Returns:
+            A human-readable explanation and reusable lesson.
+        """
+        reasons = "; ".join(failure_reasons) if failure_reasons else "Unknown failure"
+        return f"Candidate failed validation or tests in {language}: {reasons}"
+
+    def explain_optimization(
+        self,
+        original: str,
+        candidate: str,
+        benchmark_info: dict,
+        language: str,
+    ) -> str:
+        """
+        Explain verified optimizations and empirical benchmark findings.
+
+        Args:
+            original: Original source code.
+            candidate: Candidate code.
+            benchmark_info: Empirical benchmark measurements.
+            language: Target programming language.
+
+        Returns:
+            A human-readable explanation of the optimization mechanisms.
+        """
+        return self.explain_change(original, candidate, language)
+
+    def interpret_benchmark(
+        self,
+        benchmark_data: dict,
+        baseline_data: Optional[dict] = None,
+    ) -> str:
+        """
+        Interpret empirical benchmark results and assess statistical confidence.
+
+        Args:
+            benchmark_data: Candidate benchmark statistics.
+            baseline_data: Optional baseline benchmark measurements.
+
+        Returns:
+            A technical assessment of the measured performance delta.
+        """
+        return f"Benchmark completed with median runtime {benchmark_data.get('median_time', 'N/A')}s."
+
+    def verify_candidate(
+        self,
+        prompt: str,
+        system_instruction: str = "",
+    ) -> str:
+        """
+        Execute logical correctness reasoning on candidate code.
+
+        Args:
+            prompt: Structured logical verification prompt.
+            system_instruction: Optional system instruction.
+
+        Returns:
+            JSON string containing structured logical verification findings.
+        """
+        return ""
+
     @property
     @abstractmethod
     def provider_name(self) -> str:

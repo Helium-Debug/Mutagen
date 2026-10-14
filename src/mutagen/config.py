@@ -18,6 +18,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class AIProvider(str, Enum):
     """Supported AI provider backends."""
+    GEMMA = "gemma"
     GEMINI = "gemini"
     GROQ = "groq"
     FAKE = "fake"  # Deterministic test provider only
@@ -57,12 +58,37 @@ class MutagenSettings(BaseSettings):
 
     # ── AI Provider ──────────────────────────────────────────
     ai_provider: AIProvider = Field(
-        default=AIProvider.GROQ,
+        default=AIProvider.GEMMA,
         description="AI provider backend to use for mutation generation.",
     )
     ai_model: str = Field(
-        default="llama-3.3-70b-versatile",
+        default="gemma4:e4b",
         description="Model identifier for the configured AI provider.",
+    )
+    gemma_base_url: str = Field(
+        default="http://localhost:11434",
+        alias="GEMMA_BASE_URL",
+        description="Base URL for local or remote Gemma inference service (e.g. Ollama http://localhost:11434).",
+    )
+    gemma_api_key: Optional[str] = Field(
+        default=None,
+        alias="GEMMA_API_KEY",
+        description="Optional API key for authenticated Gemma endpoints.",
+    )
+    gemma_timeout: int = Field(
+        default=180,
+        alias="GEMMA_TIMEOUT",
+        description="Timeout in seconds for Gemma API calls.",
+    )
+    gemma_num_ctx: int = Field(
+        default=16384,
+        alias="GEMMA_NUM_CTX",
+        description="Context window size in tokens for local Gemma (Ollama num_ctx).",
+    )
+    gemma_max_tokens: int = Field(
+        default=8192,
+        alias="GEMMA_MAX_TOKENS",
+        description="Maximum completion tokens for Gemma API calls (Ollama num_predict).",
     )
     gemini_api_key: Optional[str] = Field(
         default=None,
@@ -72,12 +98,54 @@ class MutagenSettings(BaseSettings):
     groq_api_key: Optional[str] = Field(
         default=None,
         alias="GROQ_API_KEY",
-        description="API key for Groq. Set via GROQ_API_KEY env var.",
+        description="API key for Groq. Set via GROQ_API_KEY env var (legacy).",
     )
     groq_max_tokens: Optional[int] = Field(
         default=None,
         alias="GROQ_MAX_TOKENS",
-        description="Maximum completion tokens for Groq API calls. Defaults to model maximum up to 16384.",
+        description="Maximum completion tokens for Groq API calls (legacy).",
+    )
+
+    # ── Token Budget & Optimization ──────────────────────────
+    token_budget_per_request: Optional[int] = Field(
+        default=None,
+        alias="TOKEN_BUDGET_PER_REQUEST",
+        description="Maximum allowed tokens for a single AI request.",
+    )
+    token_budget_per_analysis: Optional[int] = Field(
+        default=None,
+        alias="TOKEN_BUDGET_PER_ANALYSIS",
+        description="Maximum allowed tokens for a single logical analysis or experiment.",
+    )
+    max_requests_per_analysis: Optional[int] = Field(
+        default=None,
+        alias="MAX_REQUESTS_PER_ANALYSIS",
+        description="Maximum AI requests allowed per analysis.",
+    )
+    daily_token_budget: Optional[int] = Field(
+        default=None,
+        alias="DAILY_TOKEN_BUDGET",
+        description="Daily token consumption budget limit.",
+    )
+    monthly_token_budget: Optional[int] = Field(
+        default=None,
+        alias="MONTHLY_TOKEN_BUDGET",
+        description="Monthly token consumption budget limit.",
+    )
+    project_token_budget: Optional[int] = Field(
+        default=None,
+        alias="PROJECT_TOKEN_BUDGET",
+        description="Token budget limit per project.",
+    )
+    enable_exact_cache: bool = Field(
+        default=True,
+        alias="ENABLE_EXACT_CACHE",
+        description="Enable exact hash-based analysis and mutation cache.",
+    )
+    enable_incremental_cache: bool = Field(
+        default=True,
+        alias="ENABLE_INCREMENTAL_CACHE",
+        description="Enable incremental function-level AST cache.",
     )
 
     # ── Authentication & Security ────────────────────────────
@@ -136,6 +204,7 @@ class MutagenSettings(BaseSettings):
     memory_limit: int = Field(default=256, ge=32, le=4096, description="MB")
     max_source_size: int = Field(default=1_048_576, ge=1024, description="Bytes")
     max_candidates_per_generation: int = Field(default=6, ge=1, le=20)
+    stop_on_stagnation: bool = Field(default=False, description="Stop evolution early if stagnation is reached")
 
     # ── Sandbox ──────────────────────────────────────────────
     sandbox_image: str = Field(default="python:3.11-slim")
@@ -158,7 +227,9 @@ class MutagenSettings(BaseSettings):
         return self
 
     def ai_configured(self) -> bool:
-        """Check whether the AI provider has the needed credentials."""
+        """Check whether the AI provider has the needed credentials or endpoint."""
+        if self.ai_provider == AIProvider.GEMMA:
+            return bool(self.gemma_base_url)
         if self.ai_provider == AIProvider.GROQ:
             return bool(self.groq_api_key)
         if self.ai_provider == AIProvider.GEMINI:
@@ -172,6 +243,11 @@ class MutagenSettings(BaseSettings):
         from mutagen.exceptions import MutagenConfigError
 
         if not self.ai_configured():
+            if self.ai_provider == AIProvider.GEMMA:
+                raise MutagenConfigError(
+                    "Gemma AI provider is not configured. "
+                    "Set GEMMA_BASE_URL (default: http://localhost:11434) in your environment or .env file."
+                )
             key_name = "GROQ_API_KEY" if self.ai_provider == AIProvider.GROQ else "GEMINI_API_KEY"
             raise MutagenConfigError(
                 f"AI provider '{self.ai_provider.value}' is not configured. "

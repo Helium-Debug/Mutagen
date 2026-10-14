@@ -110,6 +110,15 @@ def test_cli_analyze(auth_user, tmp_path):
     assert "add" in result.stdout or "Analysis" in result.stdout or "add" in result.stderr
 
 
+def test_cli_analyze_with_ai(auth_user, tmp_path):
+    py_file = tmp_path / "target.py"
+    py_file.write_text("def multiply(a, b):\n    return a * b\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["analyze", str(py_file), "--ai"])
+    assert result.exit_code == 0
+    assert "multiply" in result.output or "Analysis" in result.output or "multiply" in result.stderr
+
+
 def test_cli_project_crud(auth_user):
     # Create project
     res_create = runner.invoke(app, ["project", "create", "test-project", "--description", "A CLI test project"])
@@ -124,3 +133,39 @@ def test_cli_project_crud(auth_user):
 def test_cli_memory_list(auth_user):
     result = runner.invoke(app, ["memory", "list"])
     assert result.exit_code == 0
+
+
+def test_cli_docker_on(monkeypatch):
+    from mutagen.sandbox.docker_manager import DockerSandbox
+
+    monkeypatch.setattr(DockerSandbox, "check_availability", lambda self: (True, "Daemon reachable mock"))
+    monkeypatch.setattr(DockerSandbox, "check_image", lambda self, img=None: (True, "Image mock available"))
+
+    result = runner.invoke(app, ["docker"])
+    assert result.exit_code == 0
+    assert "Docker engine is ON" in result.output
+    assert "ready" in result.output.lower()
+
+
+def test_cli_docker_off_no_launch(monkeypatch):
+    from mutagen.sandbox.docker_manager import DockerSandbox
+
+    monkeypatch.setattr(DockerSandbox, "check_availability", lambda self: (False, "Daemon offline mock"))
+
+    result = runner.invoke(app, ["docker", "--no-launch"])
+    assert result.exit_code == 1
+    assert "Docker engine is OFF" in result.output
+
+
+def test_cli_docker_off_with_successful_launch(monkeypatch):
+    from mutagen.sandbox.docker_manager import DockerSandbox
+
+    monkeypatch.setattr(DockerSandbox, "check_availability", lambda self: (False, "Daemon offline mock"))
+    monkeypatch.setattr(DockerSandbox, "launch_docker_daemon", lambda self: (True, "Mock launched Docker"))
+    monkeypatch.setattr(DockerSandbox, "wait_for_daemon", lambda self, timeout=15, poll_interval=1.0: True)
+
+    result = runner.invoke(app, ["docker"])
+    assert result.exit_code == 0
+    assert "Docker engine is OFF" in result.output
+    assert "Attempting to start Docker" in result.output
+    assert "Docker engine is now ON" in result.output

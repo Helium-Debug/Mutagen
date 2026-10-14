@@ -86,6 +86,78 @@ class FakeProvider(AIProviderBase):
             f"This is a deterministic test explanation."
         )
 
+    def analyze_code(
+        self,
+        source_code: str,
+        language: str,
+        objective: OptimizationObjective = OptimizationObjective.BALANCED,
+        static_context: Optional[dict] = None,
+    ) -> dict:
+        """Deterministic fake analysis."""
+        return {
+            "language": language,
+            "structural_summary": {
+                "functions": ["fake_target"],
+                "classes": [],
+                "public_interface": ["fake_target"],
+                "external_dependencies": [],
+            },
+            "complexity": {
+                "estimated_time_complexity": "O(n)",
+                "estimated_space_complexity": "O(1)",
+                "bottlenecks": ["Nested loop in fake test target"],
+            },
+            "optimization_suggestions": [
+                {
+                    "target_symbol": "fake_target",
+                    "strategy": "algorithmic",
+                    "description": "Replace iteration with vectorized computation",
+                    "expected_impact": "speed improvement",
+                }
+            ],
+            "correctness_invariants": [
+                "Return type and public contract must remain identical"
+            ],
+            "usage": {
+                "input_tokens": 120,
+                "output_tokens": 155,
+                "total_tokens": 275,
+                "duration_ms": 15,
+            },
+        }
+
+    def explain_failure(
+        self,
+        original: str,
+        candidate: str,
+        failure_reasons: list[str],
+        language: str,
+    ) -> str:
+        """Return a deterministic failure explanation."""
+        reasons = "; ".join(failure_reasons) if failure_reasons else "None"
+        return f"[FAKE FAILURE] Candidate failed in {language}. Reasons: {reasons}"
+
+    def explain_optimization(
+        self,
+        original: str,
+        candidate: str,
+        benchmark_info: dict,
+        language: str,
+    ) -> str:
+        """Return a deterministic optimization explanation."""
+        return (
+            f"[FAKE OPTIMIZATION] Optimized {language} code. "
+            f"Median runtime: {benchmark_info.get('median_time', 0.001)}s."
+        )
+
+    def interpret_benchmark(
+        self,
+        benchmark_data: dict,
+        baseline_data: Optional[dict] = None,
+    ) -> str:
+        """Return a deterministic benchmark interpretation."""
+        return f"[FAKE BENCHMARK] Median runtime: {benchmark_data.get('median_time', 0.001)}s."
+
     def summarize_experiment(self, experiment_summary: dict) -> str:
         """Return a deterministic experiment summary."""
         return (
@@ -97,6 +169,25 @@ class FakeProvider(AIProviderBase):
     def check_availability(self) -> tuple[bool, str]:
         """Fake provider is always available."""
         return True, f"Fake provider ({self._model_id}) is available (test mode)"
+
+    def verify_candidate(
+        self,
+        prompt: str,
+        system_instruction: str = "",
+    ) -> str:
+        """Return structured verification response for tests."""
+        return json.dumps({
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "logical_correctness": {"status": "PASS", "reason": "All logical invariants verified."},
+            "behavior_preservation": {"status": "PASS", "reason": "Deterministic behavior preserved."},
+            "edge_cases": [
+                {"case": "empty input", "risk": "LOW", "reason": "Handled gracefully"}
+            ],
+            "detected_errors": [],
+            "suggested_tests": ["test_boundary()"],
+            "recommendation": "ACCEPT",
+        })
 
     @property
     def provider_name(self) -> str:

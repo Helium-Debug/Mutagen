@@ -60,6 +60,7 @@ class FitnessEvaluator:
         baseline_benchmark: Optional[BenchmarkResult],
         candidate_analysis: Optional[CodeAnalysis] = None,
         original_analysis: Optional[CodeAnalysis] = None,
+        verification_report: Optional[Any] = None,
     ) -> FitnessScore:
         """
         Evaluate a candidate's fitness across all objectives.
@@ -72,6 +73,7 @@ class FitnessEvaluator:
             baseline_benchmark: Original code benchmark results.
             candidate_analysis: Code analysis of the candidate.
             original_analysis: Code analysis of the original.
+            verification_report: Verification layer results.
 
         Returns:
             FitnessScore with all components.
@@ -80,6 +82,24 @@ class FitnessEvaluator:
             candidate_id=candidate_id,
             weights=self.weights,
         )
+
+        # ── Mandatory: Verification Layer ──────────────────
+        if verification_report is not None:
+            verdict_val = (
+                verification_report.final_verdict.value
+                if hasattr(verification_report.final_verdict, "value")
+                else str(verification_report.final_verdict)
+            )
+            if verdict_val == "REJECT":
+                score.correctness_score = 0.0
+                score.is_eligible = False
+                for reason in getattr(verification_report, "rejection_reasons", []):
+                    score.rejection_reasons.append(f"Verification rejected: {reason}")
+                return score
+            elif verdict_val == "ACCEPT":
+                score.correctness_score = 1.0
+            elif verdict_val == "REVIEW":
+                score.correctness_score = 0.95
 
         # ── Mandatory: Validation ──────────────────────────
         if not validation.is_valid:
@@ -91,7 +111,7 @@ class FitnessEvaluator:
         # ── Mandatory: Correctness ─────────────────────────
         if test_result:
             if test_result.all_passed:
-                score.correctness_score = 1.0
+                score.correctness_score = max(score.correctness_score, 1.0)
             else:
                 score.correctness_score = 0.0
                 reasons = []
@@ -105,8 +125,8 @@ class FitnessEvaluator:
                     f"Correctness check failed: {'; '.join(reasons)}"
                 )
                 return score
-        else:
-            # No test results — candidate cannot be verified
+        elif verification_report is None:
+            # No test results and no verification report — candidate cannot be verified
             score.correctness_score = 0.5
             score.rejection_reasons.append(
                 "No test results available — correctness unverified"
@@ -176,8 +196,8 @@ class FitnessEvaluator:
             self.weights.get("maintainability", 0.0) * score.maintainability_score
         )
 
-        # Eligibility: must pass correctness
-        score.is_eligible = score.correctness_score >= 1.0 and len(score.rejection_reasons) == 0
+        # Eligibility: must pass correctness (ACCEPT or REVIEW)
+        score.is_eligible = score.correctness_score >= 0.85 and len(score.rejection_reasons) == 0
 
         return score
 

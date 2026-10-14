@@ -290,3 +290,16 @@ def print_evolution_report(report_data: dict) -> None:
         reason = data.get("rejection_reason", "Candidate rejected during validation or testing.")
         console.print(f"[bold red]Candidate failed evaluation: {reason}[/bold red]\n")
 
+    verif_json = data.get("verification_json")
+    if verif_json:
+        try:
+            from mutagen.verification.report import format_verification_report
+            console.print(format_verification_report(verif_json))
+            console.print()
+        except Exception:
+            pass
+    elif data.get("verification_verdict"):
+        verdict = data.get("verification_verdict")
+        style = "bold green" if verdict == "ACCEPT" else ("bold yellow" if verdict == "REVIEW" else "bold red")
+        console.print(f"[bold bright_cyan]VERIFICATION VERDICT:[/] [{style}]{verdict}[/{style}]\n")
+

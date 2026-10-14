@@ -17,7 +17,7 @@ Every proposed candidate is statically analyzed, isolated in a secured execution
   │   [ 1. Analyze Source ] ───► [ 2. Retrieve Memory ] ───► [ 3. AI Mutation Engine ]     │
   │          │                           │                            │                    │
   │          ▼                           ▼                            ▼                    │
-  │     AST Complexity             3-Layer Patterns            Gemini 2.5 / Providers      │
+  │     AST Complexity             3-Layer Patterns               Gemma (Local)            │
   │                                                                   │                    │
   │   [ 6. Multi-Objective ] ◄── [ 5. Benchmark Engine ] ◄── [ 4. Isolated Sandbox ]       │
   │         Fitness                      │                     (Docker / Test Gates)       │
@@ -56,6 +56,19 @@ cd Mutagen
 pip install -e ".[dev]"
 ```
 
+### Local Gemma AI Setup
+
+MUTAGEN runs Google Gemma locally via Ollama for code analysis, mutation generation, and optimization reasoning with zero API cost and complete code privacy:
+
+```bash
+# 1. Install & start Ollama (if not already running)
+# Download from https://ollama.com or your package manager
+ollama serve
+
+# 2. Pull the recommended Gemma model (2.6GB download / ~1.6GB GGUF)
+ollama pull gemma2:2b
+```
+
 ### Environment Setup
 
 Initialize your local configuration:
@@ -70,9 +83,12 @@ mutagen doctor
 
 Configure your `.env` file:
 ```dotenv
-MUTAGEN_AI_PROVIDER=gemini
-MUTAGEN_AI_MODEL=gemini-2.5-flash
-GEMINI_API_KEY=your-gemini-api-key-here
+MUTAGEN_AI_PROVIDER=gemma
+MUTAGEN_AI_MODEL=gemma2:2b
+GEMMA_BASE_URL=http://localhost:11434
+# Optional API key if using an authenticated remote Gemma endpoint
+# GEMMA_API_KEY=
+
 MUTAGEN_DATABASE_URL=postgresql+psycopg://mutagen:mutagen@localhost:5432/mutagen
 MUTAGEN_REDIS_URL=redis://localhost:6379/0
 MUTAGEN_LOG_LEVEL=INFO
@@ -95,10 +111,24 @@ docker compose up -d
 
 MUTAGEN provides an intuitive, rich terminal command interface:
 
-### 1. Source Code Analysis
+### 1. Docker Sandbox Management
+Check Docker engine status and automatically launch Docker Desktop if offline:
+```bash
+# Check status and automatically launch Docker Desktop if off
+mutagen docker
+
+# Check status without launching
+mutagen docker --no-launch
+```
+
+### 2. Source Code Analysis
 Analyze AST metrics, cyclomatic complexity, halstead metrics, and interfaces:
 ```bash
+# Fast static AST analysis
 mutagen analyze examples/fibonacci.py
+
+# AI-assisted deep analysis with Gemma (structural, bottlenecks, invariants)
+mutagen analyze examples/fibonacci.py --ai
 ```
 
 ### 2. Evolutionary Code Optimization
@@ -163,6 +193,34 @@ mutagen verify <experiment_id>
 mutagen export <experiment_id> --output ./optimized_fibonacci.py
 ```
 
+### 7. Token Usage Tracker & Optimization Engine
+Inspect actual AI token consumption, cache performance, and estimated tokens avoided:
+```bash
+# Display the interactive token usage dashboard
+python -m mutagen usage
+
+# Inspect documented token savings and avoided AI calls
+python -m mutagen usage --savings
+
+# View detailed paginated AI request audit records
+python -m mutagen usage --detailed --page 1 --limit 20
+
+# View cache hit performance and layer breakdown
+python -m mutagen usage --cache
+
+# Filter usage by date range or operation
+python -m mutagen usage --today
+python -m mutagen usage --since 2026-10-01 --until 2026-10-13
+python -m mutagen usage --operation analyze
+
+# Export standardized usage reports
+python -m mutagen usage --export csv
+python -m mutagen usage --export json
+
+# Pure machine-readable JSON output (unformatted)
+python -m mutagen usage --json
+```
+
 ---
 
 ## 🧬 Benchmark Target Examples
@@ -200,6 +258,7 @@ Test categories include:
 - `test_benchmarking.py`: Statistical aggregation and comparison
 - `test_cli.py`: Typer commands and Rich UI output
 - `test_evolution.py`: Multi-generation end-to-end evolution engine integration
+- `test_token_tracker.py`: Centralized token usage tracking, reduction engine, and CLI
 
 ---
 

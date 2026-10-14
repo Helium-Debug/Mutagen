@@ -7,9 +7,9 @@ import statistics
 import time
 import heapq
 from collections import Counter, defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, List, Tuple, Dict
 from datetime import datetime, timezone
 from functools import lru_cache
 
@@ -88,24 +88,38 @@ class Tool:
 class ToolRegistry:
     def __init__(self):
         self.tools = {}
+        # Max workers set to 4 as per original code
         self.executor = ThreadPoolExecutor(max_workers=4)
 
-    def register(self, tool):
+    def register(self, tool: Tool):
         self.tools[tool.name] = tool
 
-    def execute(self, name, *args, **kwargs):
+    def execute(self, name: str, *args, **kwargs) -> Any:
         if name not in self.tools:
             raise KeyError(f"Unknown tool: {name}")
         return self.tools[name].execute(*args, **kwargs)
 
-    def execute_parallel(self, requests):
-        futures = {
-            name: self.executor.submit(self.execute, name, *args, **kwargs)
-            for name, args, kwargs in requests
-        }
-        return {name: future.result(timeout=10) for name, future in futures.items()}
+    def execute_parallel(self, requests: List[Tuple[str, Tuple, Dict]]) -> Dict[str, Any]:
+        """Executes multiple tools concurrently.
+        requests format: [(name, args_tuple, kwargs_dict)]
+        """
+        futures: Dict[str, Future] = {}
+        results: Dict[str, Any] = {}
 
-    def describe(self):
+        for name, args, kwargs in requests:
+            future = self.executor.submit(self.execute, name, *args, **kwargs)
+            futures[name] = future
+
+        # Wait and collect results with timeout
+        for name, future in futures.items():
+            try:
+                results[name] = future.result(timeout=10)
+            except Exception as e:
+                # Log or handle execution errors gracefully
+                results[name] = f"Error executing tool {name}: {e}"
+        return results
+
+    def describe(self) -> List[Dict[str, Any]]:
         return [
             {
                 "name": tool.name,
@@ -118,7 +132,7 @@ class ToolRegistry:
 
 
 class ReasoningEngine:
-    def __init__(self, memory, registry):
+    def __init__(self, memory: AgentMemory, registry: ToolRegistry):
         self.memory = memory
         self.registry = registry
         self.max_depth = 8
@@ -131,7 +145,7 @@ class ReasoningEngine:
             "novelty": 0.10,
         }
 
-    def classify(self, query):
+    def classify(self, query: str) -> str:
         tokens = _WORD_RE.findall(query.lower())
         if any(word in tokens for word in ("calculate", "sum", "multiply", "divide")):
             return "calculation"
@@ -143,11 +157,13 @@ class ReasoningEngine:
             return "random"
         return "conversation"
 
-    def score(self, query, candidate, depth=0):
+    def score(self, query: str, candidate: Any, depth: int = 0) -> float:
         relevance = self.memory.similarity(query, candidate)
+        # Sigmoid function approximation for confidence based on relevance
         confidence = 1.0 / (1.0 + math.exp(-4 * (relevance - 0.5)))
         recency = math.exp(-depth / max(self.max_depth, 1))
-        complexity = min(len(candidate.split()) / 100, 1)
+        # Complexity: normalized word count
+        complexity = min(len(str(candidate).split()) / 100, 1)
         novelty = 1.0 - relevance
         return (
             relevance * self.planning_weights["relevance"]
@@ -157,7 +173,7 @@ class ReasoningEngine:
             + novelty * self.planning_weights["novelty"]
         )
 
-    def plan(self, query):
+    def plan(self, query: str) -> List[Dict[str, Any]]:
         category = self.classify(query)
         memories = self.memory.retrieve(query)
         candidates = [
@@ -171,7 +187,7 @@ class ReasoningEngine:
         ]
         return sorted(candidates, key=lambda item: item["score"], reverse=True)
 
-    def reason(self, query):
+    def reason(self, query: str) -> Any:
         plan = self.plan(query)
         category = self.classify(query)
         if category == "calculation":
@@ -191,14 +207,14 @@ class ReasoningEngine:
             return "\n".join(item["content"] for item in plan[:3])
         return self.generate_response(query, plan)
 
-    def generate_response(self, query, plan):
+    def generate_response(self, query: str, plan: List[Dict[str, Any]]) -> str:
         if not plan or plan[0]["score"] < self.confidence_threshold:
             return f"I am a simple local agent. You said: {query}"
         return f"Based on stored context: {plan[0]['content']}"
 
 
 class SimpleAgent:
-    def __init__(self, name="BloatedAgent"):
+    def __init__(self, name: str = "BloatedAgent"):
         self.name = name
         self.memory = AgentMemory()
         self.registry = ToolRegistry()
@@ -229,20 +245,21 @@ class SimpleAgent:
         )
         self.registry.register(Tool("json_encode", "Serialize data to JSON", lambda data: json.dumps(data, default=str)))
 
-    async def process(self, query):
+    async def process(self, query: str) -> Any:
         started = time.perf_counter()
         self.turn_count += 1
         self.memory.history.append(Message("user", query))
+        # Run synchronous reasoning in a separate thread to avoid blocking the event loop
         response = await asyncio.to_thread(self.engine.reason, query)
         self.memory.history.append(Message("assistant", response))
         self.metrics["latency"].append(time.perf_counter() - started)
         self.metrics["turns"].append(self.turn_count)
         return response
 
-    def remember(self, key, value):
+    def remember(self, key: Any, value: Any):
         self.memory.remember(key, value)
 
-    def status(self):
+    def status(self) -> Dict[str, Any]:
         return {
             "name": self.name,
             "running": self.running,
@@ -279,6 +296,7 @@ class SimpleAgent:
         try:
             while self.running:
                 try:
+                    # Use asyncio to run blocking input in a thread
                     query = await asyncio.to_thread(input, "agent> ")
                 except (EOFError, KeyboardInterrupt):
                     break

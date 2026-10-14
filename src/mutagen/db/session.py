@@ -28,14 +28,23 @@ def get_engine() -> Engine:
         if settings.database_url.startswith("sqlite"):
             _engine = create_engine(
                 settings.database_url,
+                connect_args={"timeout": 30},
                 echo=False,
             )
         else:
+            connect_args = {
+                "keepalives": 1,
+                "keepalives_idle": 30,
+                "keepalives_interval": 10,
+                "keepalives_count": 5,
+            }
             _engine = create_engine(
                 settings.database_url,
                 pool_size=5,
                 max_overflow=10,
                 pool_pre_ping=True,
+                pool_recycle=300,
+                connect_args=connect_args,
                 echo=False,
             )
     return _engine
@@ -46,9 +55,10 @@ def get_session_factory() -> sessionmaker[Session]:
     global _session_factory
     if _session_factory is None:
         engine = get_engine()
-        settings = get_settings()
-        if settings.database_url.startswith("sqlite"):
+        try:
             init_db(engine)
+        except Exception:
+            pass
         _session_factory = sessionmaker(bind=engine, expire_on_commit=False)
     return _session_factory
 
@@ -87,8 +97,28 @@ def init_db(engine: Optional[Engine] = None) -> None:
                 "ALTER TABLE experiments ADD COLUMN IF NOT EXISTS user_id VARCHAR(36) REFERENCES users(id) ON DELETE SET NULL;",
                 "ALTER TABLE memory_records ADD COLUMN IF NOT EXISTS user_id VARCHAR(36) REFERENCES users(id) ON DELETE CASCADE;",
                 "ALTER TABLE ai_usage_records ADD COLUMN IF NOT EXISTS user_id VARCHAR(36);",
+                "ALTER TABLE ai_usage_records ADD COLUMN IF NOT EXISTS project_id VARCHAR(36);",
+                "ALTER TABLE ai_usage_records ADD COLUMN IF NOT EXISTS analysis_id VARCHAR(36);",
+                "ALTER TABLE ai_usage_records ADD COLUMN IF NOT EXISTS candidate_id VARCHAR(36);",
+                "ALTER TABLE ai_usage_records ADD COLUMN IF NOT EXISTS generation_number INTEGER;",
+                "ALTER TABLE ai_usage_records ADD COLUMN IF NOT EXISTS attempt_number INTEGER DEFAULT 1;",
+                "ALTER TABLE ai_usage_records ADD COLUMN IF NOT EXISTS usage_source VARCHAR(50) DEFAULT 'provider_reported';",
+                "ALTER TABLE ai_usage_records ADD COLUMN IF NOT EXISTS cached_input_tokens INTEGER DEFAULT 0;",
+                "ALTER TABLE ai_usage_records ADD COLUMN IF NOT EXISTS estimated_input_tokens INTEGER;",
+                "ALTER TABLE ai_usage_records ADD COLUMN IF NOT EXISTS estimated_output_tokens INTEGER;",
+                "ALTER TABLE ai_usage_records ADD COLUMN IF NOT EXISTS estimated_total_tokens INTEGER;",
+                "ALTER TABLE ai_usage_records ADD COLUMN IF NOT EXISTS request_id VARCHAR(64);",
+                "ALTER TABLE ai_usage_records ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'success';",
+                "ALTER TABLE ai_usage_records ADD COLUMN IF NOT EXISTS latency_ms INTEGER DEFAULT 0;",
+                "ALTER TABLE ai_usage_records ADD COLUMN IF NOT EXISTS metadata_json JSON;",
                 "ALTER TABLE optimization_certificates ADD COLUMN IF NOT EXISTS user_id VARCHAR(36);",
                 "ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS user_id VARCHAR(36);",
+                "ALTER TABLE mutation_candidates ADD COLUMN IF NOT EXISTS verification_passed BOOLEAN DEFAULT FALSE;",
+                "ALTER TABLE mutation_candidates ADD COLUMN IF NOT EXISTS verification_verdict VARCHAR(20);",
+                "ALTER TABLE mutation_candidates ADD COLUMN IF NOT EXISTS verification_json JSON;",
+                "ALTER TABLE ai_usage_records ALTER COLUMN input_tokens DROP NOT NULL;",
+                "ALTER TABLE ai_usage_records ALTER COLUMN output_tokens DROP NOT NULL;",
+                "ALTER TABLE ai_usage_records ALTER COLUMN total_tokens DROP NOT NULL;",
             ]
             for stmt in migration_stmts:
                 try:
